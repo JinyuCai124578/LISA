@@ -15,10 +15,20 @@ from torch.utils.tensorboard import SummaryWriter
 
 from model.LISA import LISAForCausalLM
 from model.llava import conversation as conversation_lib
-from utils.dataset import HybridDataset, ValDataset, collate_fn
+from utils.dataset import HybridDataset, ValDataset, collate_fn, ValDataset_EM
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          AverageMeter, ProgressMeter, Summary, dict_to_cuda,
                          intersectionAndUnionGPU)
+import pdb
+import traceback
+
+def info(type, value, tb):
+    traceback.print_exception(type, value, tb)
+    print()
+    pdb.pm()
+
+sys.excepthook = info
+
 
 
 def parse_args(args):
@@ -60,7 +70,7 @@ def parse_args(args):
     parser.add_argument("--reason_seg_data", default="ReasonSeg|train", type=str)
     parser.add_argument("--val_dataset", default="ReasonSeg|val", type=str)
     parser.add_argument("--dataset_dir", default="./dataset", type=str)
-    parser.add_argument("--log_base_dir", default="./runs", type=str)
+    parser.add_argument("--log_base_dir", default="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/runs", type=str)
     parser.add_argument("--exp_name", default="lisa", type=str)
     parser.add_argument("--epochs", default=10, type=int)
     parser.add_argument("--steps_per_epoch", default=500, type=int)
@@ -103,6 +113,9 @@ def parse_args(args):
         type=str,
         choices=["llava_v1", "llava_llama_2"],
     )
+    parser.add_argument("--use_gpt_qa", action="store_true", default=False)
+    parser.add_argument("--train_from_scratch", action="store_true", default=False)
+    parser.add_argument('--train_mask_decoder_only', action='store_true', default=False)
     return parser.parse_args(args)
 
 
@@ -118,7 +131,7 @@ def main(args):
     # Create model
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.version,
-        cache_dir=None,
+        cache_dir="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/lisa",
         model_max_length=args.model_max_length,
         padding_side="right",
         use_fast=False,
@@ -149,7 +162,9 @@ def main(args):
     elif args.precision == "fp16":
         torch_dtype = torch.half
     model = LISAForCausalLM.from_pretrained(
-        args.version, torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
+        args.version,
+        # cache_dir="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/lisa",
+        torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
     )
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
@@ -181,7 +196,7 @@ def main(args):
             lora_module_names = set()
             for name, module in model.named_modules():
                 if (
-                    isinstance(module, cls)
+                    isinstance(module, cls) # 只看线性层
                     and all(
                         [
                             x not in name
@@ -190,10 +205,10 @@ def main(args):
                                 "vision_tower",
                                 "mm_projector",
                                 "text_hidden_fcs",
-                            ]
+                            ] # 不希望用lora的模块
                         ]
                     )
-                    and any([x in name for x in lora_target_modules])
+                    and any([x in name for x in lora_target_modules]) # 只对lora_target_modules的线性层应用LoRA
                 ):
                     lora_module_names.add(name)
             return sorted(list(lora_module_names))
@@ -203,13 +218,14 @@ def main(args):
         lora_target_modules = find_linear_layers(
             model, args.lora_target_modules.split(",")
         )
+        print("lora module",lora_target_modules)
         lora_config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
             target_modules=lora_target_modules,
             lora_dropout=lora_dropout,
             bias="none",
-            task_type="CAUSAL_LM",
+            task_type="CAUSAL_LM", # 因果语言模型；通常用于生成式语言模型
         )
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
@@ -217,15 +233,31 @@ def main(args):
     model.resize_token_embeddings(len(tokenizer))
 
     # make text_hidden_fcs, mask_decoder, lm_head, embed_tokens trainable
+    if args.train_mask_decoder_only:
+        trainable_params=["mask_decoder"]
+    else:
+        trainable_params=["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
     for n, p in model.named_parameters():
         if any(
             [
                 x in n
-                for x in ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
+                for x in trainable_params
             ]
         ):
             print("n: ", n, "p.shape: ", p.shape)
             p.requires_grad = True
+    # pdb.set_trace()
+    if not args.train_from_scratch:
+        print("loading from pretrained")
+        lisa_params=torch.load('lisa_params.pt')
+        for name, param in lisa_params.items():
+            # print(name)
+            name="base_model.model."+name
+            # pdb.set_trace()
+            if name in model.state_dict():
+                # print("load {}".format(name))
+                model.state_dict()[name].copy_(param)
+        del lisa_params
 
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1
@@ -248,16 +280,27 @@ def main(args):
         vqa_data=args.vqa_data,
         reason_seg_data=args.reason_seg_data,
         explanatory=args.explanatory,
+        use_gpt_qa=args.use_gpt_qa,
     )
 
     if args.no_eval == False:
-        val_dataset = ValDataset(
-            args.dataset_dir,
-            tokenizer,
-            args.vision_tower,
-            args.val_dataset,
-            args.image_size,
-        )
+        if args.val_dataset == "reason_seg_em":
+            val_dataset = ValDataset_EM(
+                args.dataset_dir,
+                tokenizer,
+                args.vision_tower,
+                args.reason_seg_data+"_val",
+                args.image_size,
+                use_gpt_qa=args.use_gpt_qa,
+            )
+        else:
+            val_dataset = ValDataset(
+                args.dataset_dir,
+                tokenizer,
+                args.vision_tower,
+                args.val_dataset,
+                args.image_size,
+            )
         print(
             f"Training with {len(train_dataset)} examples and validating with {len(val_dataset)} examples."
         )
@@ -569,6 +612,7 @@ def validate(val_loader, model_engine, epoch, writer, args):
     acc_iou_meter.all_reduce()
 
     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
+    # pdb.set_trace()
     ciou = iou_class[1]
     giou = acc_iou_meter.avg[1]
 

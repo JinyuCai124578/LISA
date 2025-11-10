@@ -143,8 +143,32 @@ def main(args):
 
     model.resize_token_embeddings(len(tokenizer))
 
-    state_dict = torch.load(args.weight, map_location="cpu")
-    model.load_state_dict(state_dict, strict=True)
+    # state_dict = torch.load(args.weight, map_location="cpu")
+    # model.load_state_dict(state_dict, strict=True)
+
+    # for deepspeed version higher than 0.15.2 https://github.com/dvlab-research/LISA/issues/90
+    import json
+    index_file = os.path.join(args.weight, "pytorch_model.bin.index.json")
+
+    with open(index_file, "r", encoding="utf-8") as f:
+        index_dict = json.load(f)
+
+    weight_map = index_dict["weight_map"]  # dict
+
+    shard_files = set(weight_map.values()) 
+    full_state_dict = {}
+
+    for shard_file in shard_files:
+        shard_path = os.path.join(args.weight, shard_file)
+        shard_state_dict = torch.load(shard_path, map_location="cpu")
+        full_state_dict.update(shard_state_dict)
+
+    """
+    RuntimeError: Error(s) in loading state_dict for PeftModelForCausalLM:
+            size mismatch for base_model.model.model.embed_tokens.weight: copying a param with shape torch.Size([32004, 5120]) from checkpoint, the shape in current model is torch.Size([32003, 5120]).
+            size mismatch for base_model.model.lm_head.weight: copying a param with shape torch.Size([32004, 5120]) from checkpoint, the shape in current model is torch.Size([32003, 5120]).
+    """
+    model.load_state_dict(full_state_dict, strict=True)
 
     model = model.merge_and_unload()
     state_dict = {}

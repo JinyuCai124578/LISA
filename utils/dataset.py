@@ -18,13 +18,18 @@ from model.segment_anything.utils.transforms import ResizeLongestSide
 from .conversation import get_default_conv_template
 from .data_processing import get_mask_from_json
 from .reason_seg_dataset import ReasonSegDataset
+from .reason_seg_dataset_em import ReasonSegDataset_EM
 from .refer import REFER
 from .refer_seg_dataset import ReferSegDataset
 from .sem_seg_dataset import SemSegDataset
 from .utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                     DEFAULT_IMAGE_TOKEN)
+from .utils import (ANSWER_LIST, DEFAULT_IMAGE_TOKEN,
+                    EXPLANATORY_QUESTION_LIST, LONG_QUESTION_LIST,
+                    SHORT_QUESTION_LIST, COT_ANSWER_LIST)
 from .vqa_dataset import VQADataset
-
+import json
+from PIL import Image
 
 def collate_fn(
     batch, tokenizer=None, conv_type="llava_v1", use_mm_start_end=True, local_rank=-1
@@ -183,6 +188,7 @@ class HybridDataset(torch.utils.data.Dataset):
         vqa_data="llava_instruct_150k",
         reason_seg_data="ReasonSeg|train",
         explanatory=0.1,
+        use_gpt_qa=False,
     ):
         self.exclude_val = exclude_val
         self.dataset = dataset
@@ -256,6 +262,22 @@ class HybridDataset(torch.utils.data.Dataset):
                         exclude_val,
                         reason_seg_data,
                         explanatory,
+                    )
+                )
+            elif dataset == "reason_seg_em":
+                self.all_datasets.append(
+                    ReasonSegDataset_EM(
+                        base_image_dir,
+                        tokenizer,
+                        vision_tower,
+                        samples_per_epoch,
+                        precision,
+                        image_size,
+                        num_classes_per_sample,
+                        exclude_val,
+                        reason_seg_data+"_train",
+                        explanatory=-1,
+                        use_gpt_qa=use_gpt_qa,
                     )
                 )
 
@@ -459,6 +481,246 @@ class ValDataset(torch.utils.data.Dataset):
             conversations,
             masks,
             labels,
+            resize,
+            None,
+            None,
+            inference,
+        )
+
+
+class ValDataset_EM(torch.utils.data.Dataset):
+    pixel_mean = torch.Tensor([140, 140, 140]).view(-1, 1, 1)
+    pixel_std = torch.Tensor([40, 40, 40]).view(-1, 1, 1)
+    img_size = 1024
+    ignore_label = 255
+
+    def __init__(
+        self,
+        base_image_dir,
+        tokenizer,
+        vision_tower,
+        val_dataset="organelle||plantorgan||cremi_val",
+        image_size=1024,
+        explanatory=-1,
+        use_gpt_qa=False
+    ):
+        self.base_image_dir = base_image_dir
+        self.short_question_list = SHORT_QUESTION_LIST
+        self.long_question_list = LONG_QUESTION_LIST
+        self.answer_list = ANSWER_LIST
+        self.cot_answer_list= COT_ANSWER_LIST
+        self.explanatory = explanatory
+
+        self.image_size = image_size
+        self.tokenizer = tokenizer
+        self.transform = ResizeLongestSide(image_size)
+        self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
+
+        reason_seg_data,splits=val_dataset.split("_")[0], val_dataset.split("_")[1]
+        reason_seg_data=reason_seg_data.replace("material","ceramic||defect||micronet||nanoparticle")
+        reason_seg_data_ls = reason_seg_data.split("||")
+        # prepare self.img_to_explanation for all datasets
+        self.json_data_list = []
+        for data in reason_seg_data_ls:
+            if use_gpt_qa:
+                json_path=os.path.join(base_image_dir,  data, f"{splits}_d_qa.json")
+            else:
+                json_path=os.path.join(base_image_dir,  data, f"{splits}.json")
+            json_data=json.load(open(json_path))
+            for item in json_data:
+                item['image_path']=os.path.join(base_image_dir, data, item['image_name'])
+                item['data_root']=os.path.join(base_image_dir, data)
+            self.json_data_list.extend(json_data)
+        self.use_gpt_qa = use_gpt_qa
+        self.explanatory_question_list = EXPLANATORY_QUESTION_LIST
+
+
+    def __len__(self):
+        return len(self.json_data_list)
+
+    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize pixel values and pad to a square input."""
+        # Normalize colors
+        x = (x - self.pixel_mean) / self.pixel_std
+
+        # Pad
+        h, w = x.shape[-2:]
+        padh = self.img_size - h
+        padw = self.img_size - w
+        x = F.pad(x, (0, padw, 0, padh))
+        return x
+
+    def __getitem__(self, idx):
+        # images, jsons = self.reason_seg_data
+        idx = random.randint(0, len(self.json_data_list) - 1)
+        image_path = self.json_data_list[idx]["image_path"]
+
+        # if "tif" in image_path:
+        #     image=cv2.imread(image_path,cv2.IMREAD_UNCHANGED)
+        # else:
+        #     image = cv2.imread(image_path)
+        # image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # 使用Pillow打开图像
+        # image = Image.open(image_path)
+
+        # # 如果需要将图像转换为RGB模式（例如，图像是灰度或其他模式）
+        # if image.mode != 'RGB':
+        #     image = image.convert('RGB')
+        # image=np.array(image)
+        if "tiff" in image_path:
+            image=cv2.imread(image_path,cv2.IMREAD_UNCHANGED)
+            image = (image-np.min(image))/(np.max(image)-np.min(image)) *255
+            image=cv2.cvtColor(image.astype(np.uint8),cv2.COLOR_GRAY2BGR)
+        else:
+            image = cv2.imread(image_path)
+        # pdb.set_trace()
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        ori_size = image.shape[:2]
+        # preprocess image for clip
+        if np.max(image)>1 or np.min(image)<0:
+            image = (image-np.min(image))/(np.max(image)-np.min(image))
+        image_clip = self.clip_image_processor.preprocess(image, return_tensors="pt")[
+            "pixel_values"
+        ][0]
+
+        # mask, sents, is_sentence = get_mask_from_json(json_path, image)
+        is_sentence = self.json_data_list[idx]['is_sentence']
+        sents=self.json_data_list[idx]['text']
+        if "ceramic" in image_path.lower() or "nanoparticle" in image_path.lower():
+            masks=[np.array(Image.open(os.path.join(self.json_data_list[idx]["data_root"], s["mask_name"])).convert('L'))==s["color_id"] if "color_id" in s.keys() 
+               else np.array(Image.open(os.path.join(self.json_data_list[idx]["data_root"], s["mask_name"])).convert('L'))!=0
+               for s in self.json_data_list[idx]['shapes']]
+        else:
+            masks=[np.array(Image.open(os.path.join(self.json_data_list[idx]["data_root"], s["mask_name"])))==s["color_id"] if "color_id" in s.keys() 
+               else np.array(Image.open(os.path.join(self.json_data_list[idx]["data_root"], s["mask_name"])))!=0
+               for s in self.json_data_list[idx]['shapes']]
+
+        sampled_sents = sents
+        sampled_masks = masks
+        image = self.transform.apply_image(image)  # preprocess image for sam
+        resize = image.shape[:2]
+
+        image_name = image_path.split("/")[-1]
+        if self.explanatory != -1 and image_name in self.img_to_explanation:
+            if random.random() < self.explanatory:
+                choice = 2
+            else:
+                choice = random.randint(0, 1)
+
+        questions = []
+        answers = []
+        for i, text in enumerate(sampled_sents):
+            if is_sentence:
+                question_template = random.choice(self.long_question_list)
+                if self.use_gpt_qa:
+                    """
+                    use my qa pair generated by gpt
+                    """
+                    # pdb.set_trace()
+                    class_name=self.json_data_list[idx]["shapes"][i]["class_name"]
+                    # qa_list=self.json_data_list[idx]["gpt_qa"]
+                    # qa_list_class=[qa for qa in qa_list if qa["class_name"].lower() == class_name.lower()]
+                    qa_list_class=[]
+                    for shape in self.json_data_list[idx]["shapes"]:
+                        if shape["class_name"].lower() == class_name.lower():
+                            qa_list_class=shape["qa_list"]
+                    if len(qa_list_class)>0:
+                        qa_dict=random.choice(qa_list_class)
+                        text=qa_dict["question"]
+                        answer=qa_dict["answer"]
+                        answer =  " {}".format(answer) + random.choice(self.cot_answer_list) 
+                        questions.append(question_template.format(sent=text))
+                        questions[-1] = (
+                            DEFAULT_IMAGE_TOKEN
+                            + "\n"
+                            + text
+                            + " {}".format(random.choice(self.explanatory_question_list))
+                        )
+                        answers.append(answer)
+                        # print(text,answer)
+                        conversations = []
+                        conv = conversation_lib.default_conversation.copy()
+                        roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
+
+                        i = 0
+                        while i < len(questions):
+                            conv.messages = []
+                            conv.append_message(conv.roles[0], questions[i])
+                            conv.append_message(conv.roles[1], answers[i])
+                            conversations.append(conv.get_prompt())
+                            i += 1
+                        continue
+                questions.append(question_template.format(sent=text))
+            else:
+                question_template = random.choice(self.short_question_list)
+                questions.append(question_template.format(class_name=text.lower()))
+
+            # add explanation if applicable
+            img_name = image_path.split("/")[-1]
+            if self.explanatory != -1 and img_name in self.img_to_explanation:
+                if choice == 0:  # [SEG] token
+                    answers.append(random.choice(self.answer_list))
+                elif choice == 1:  # [SEG] token + texhat answer
+                    image_name = image_path.split("/")[-1]
+                    answer = self.img_to_explanation[image_name]["outputs"]
+                    answer = random.choice(self.answer_list) + " {}".format(answer)
+                    questions[-1] = (
+                        DEFAULT_IMAGE_TOKEN
+                        + "\n"
+                        + text
+                        + " {}".format(random.choice(self.explanatory_question_list))
+                    )
+                    answers.append(answer)
+                elif choice == 2:  # vanilla text answer
+                    image_name = image_path.split("/")[-1]
+                    answer = self.img_to_explanation[image_name]["outputs"]
+                    questions[-1] = DEFAULT_IMAGE_TOKEN + "\n" + text
+                    answers.append(answer)
+                else:
+                    raise ValueError("Not implemented yet.")
+            else:
+                answers.append(random.choice(self.answer_list))
+
+            conversations = []
+            conv = conversation_lib.default_conversation.copy()
+            roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
+
+            i = 0
+            while i < len(questions):
+                conv.messages = []
+                conv.append_message(conv.roles[0], questions[i])
+                conv.append_message(conv.roles[1], answers[i])
+                conversations.append(conv.get_prompt())
+                i += 1
+
+        image = self.preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
+
+        image_name = image_path.split("/")[-1]
+        if (
+            self.explanatory != -1
+            and image_name in self.img_to_explanation
+            and choice == 2
+        ):
+            masks = torch.rand(0, *ori_size)
+            label = torch.ones(ori_size) * self.ignore_label
+        else:
+            masks = np.stack(sampled_masks, axis=0)
+            masks = torch.from_numpy(masks)
+            label = torch.ones(masks.shape[1], masks.shape[2]) * self.ignore_label
+
+        # print("Masks shape: ", masks.shape, "selected_sents: ", len(sampled_sents))
+        assert masks.shape[0] == len(sampled_sents), (
+            masks.shape,
+            len(sampled_sents),
+        )
+        inference = True
+        return (
+            image_path,
+            image,
+            image_clip,
+            conversations,
+            masks,
+            label,
             resize,
             None,
             None,

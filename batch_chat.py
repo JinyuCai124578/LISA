@@ -69,6 +69,7 @@ def main(args):
     # 清理cuda cache
     torch.cuda.empty_cache()
     args = parse_args(args)
+    args.vis_save_path = os.path.join(args.vis_save_path, args.version.split("/")[-1])
     os.makedirs(args.vis_save_path, exist_ok=True)
 
     # Create model
@@ -166,15 +167,10 @@ def main(args):
     
     model.eval()
 
-    while True:
+    def chat(prompt,image_path,class_name):
         conv = conversation_lib.conv_templates[args.conv_type].copy()
         conv.messages = []
 
-        prompt = input("Please input your prompt: ")
-        if prompt=='exit': 
-            torch.cuda.empty_cache()
-            print("bye")
-            break
         prompt = DEFAULT_IMAGE_TOKEN + "\n" + prompt
         if args.use_mm_start_end:
             replace_token = (
@@ -186,12 +182,17 @@ def main(args):
         conv.append_message(conv.roles[1], "")
         prompt = conv.get_prompt()
 
-        image_path = input("Please input the image path: ")
         if not os.path.exists(image_path):
             print("File not found in {}".format(image_path))
-            continue
+            return
+        
+        if "tiff" in image_path:
+            image=cv2.imread(image_path,cv2.IMREAD_UNCHANGED)
+            image = (image-np.min(image))/(np.max(image)-np.min(image)) *255
+            image_np=cv2.cvtColor(image.astype(np.uint8),cv2.COLOR_GRAY2BGR)
+        else:
+            image_np = cv2.imread(image_path)
 
-        image_np = cv2.imread(image_path)
         image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
         original_size_list = [image_np.shape[:2]]
 
@@ -250,13 +251,13 @@ def main(args):
             pred_mask = pred_mask > 0
 
             save_path = "{}/{}_mask_{}.jpg".format(
-                args.vis_save_path, image_path.split("/")[-1].split(".")[0], i
+                args.vis_save_path, class_name, i
             )
             cv2.imwrite(save_path, pred_mask * 100)
             print("{} has been saved.".format(save_path))
 
             save_path = "{}/{}_masked_img_{}.jpg".format(
-                args.vis_save_path, image_path.split("/")[-1].split(".")[0], i
+                args.vis_save_path, class_name, i
             )
             save_img = image_np.copy()
             save_img[pred_mask] = (
@@ -266,7 +267,11 @@ def main(args):
             save_img = cv2.cvtColor(save_img, cv2.COLOR_RGB2BGR)
             cv2.imwrite(save_path, save_img)
             print("{} has been saved.".format(save_path))
-
+        return
+    import json
+    sample_dict = json.load(open("/home/bingxing2/ailab/caijinyu/LISA/chat_sample.json"))
+    for i in range(len(sample_dict)):
+        chat(sample_dict[i]["prompt"],sample_dict[i]["image"],sample_dict[i]["class"])
 
 if __name__ == "__main__":
     main(sys.argv[1:])

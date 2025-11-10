@@ -41,6 +41,15 @@ ANSWER_LIST = [
     "[SEG].",
 ]
 
+COT_ANSWER_LIST = [
+    'Accordingly, the segmentation result is [SEG].',
+    'Thus, the segmentation result is [SEG].',
+    'Therefore, the final segmentation is [SEG].',
+    'Based on the analysis, the segmentation output is [SEG].',
+    'As a result, the segmented regions are marked as [SEG].',
+    'In conclusion, the segmentation map corresponds to [SEG].',
+]
+
 
 class Summary(Enum):
     NONE = 0

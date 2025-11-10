@@ -1,0 +1,112 @@
+[
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/plantorgan/image/C080.tif",
+        "prompt":"Outline every organelle involved in the Calvin cycle, evidenced by the presence of ribulose-1,5-bisphosphate carboxylase (RuBisCO) in the stroma. Please output segmentation mask and explain why.",
+        "class": "plantorgan_chloroplast"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/plantorgan/image/C080.tif",
+        "prompt":"Identify and outline every large, membrane-bound organelle filled with a translucent fluid (cell sap) and occupying most of the cell volume.",
+        "class": "plantorgan_vacuole"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/plantorgan/image/C080.tif",
+        "prompt":"Segment all structures with: 1) a double nuclear membrane, 2) nuclear pores, and 3) heterochromatin/euchromatin patterns",
+        "class": "plantorgan_nuclear"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/plantorgan/image/C080.tif",
+        "prompt":"Segment all organelles with double membranes and internal cristae folds",
+        "class": "plantorgan_mitochondria"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/cremi/image/patch_B_120_007.png",
+        "prompt":"Identify and mask the precise gap between pre- and post-synaptic membranes where synaptic vesicles fuse in this grayscale EM micrograph.",
+        "class": "cremi_cleft"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/cremi/image/patch_B_120_007.png",
+        "prompt":"Create a segmentation mask of axon terminals with docked vesicles, indicating potential neurotransmitter release sites in this neural EM image.",
+        "class": "cremi_pre"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/cremi/image/patch_B_120_007.png",
+        "prompt":"Output a segmentation mask of dendrites receiving synaptic input, identifiable by their opposed positioning to vesicle-filled terminals.",
+        "class": "cremi_post"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/cremi/image/patch_B_120_007.png",
+        "prompt":"Can you identify the pair of neurons most likely forming a synaptic connection in this electron microscopic image? Please output a neuron segmentation mask for neurons.",
+        "class": "cremi_pre_post"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/organelle/image/f58017ff99c87e7dec2f1ba7aa80792203cebfc39481fa63a96d46889059350b.jpg",
+        "prompt":"Segment all organelles with double membranes and internal cristae folds",
+        "class": "organelle_mitochondria"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/organelle/image/2eb87dab0a784db46ee1b9a93e08bd010461129d91842801797d2c2ef581af9b.jpg",
+        "prompt":"Segment all structures with: 1) a double nuclear membrane, 2) nuclear pores, and 3) heterochromatin/euchromatin patterns",
+        "class": "organelle_nuclear"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/organelle/image/6d5f1cadeab1ce3dee369d6be6a68bd70a436bc0c31baaeeef0c4fdb8122146f.jpg",
+        "prompt":"Find the double-layer membrane organelle that is involved in protein and lipid synthesis",
+        "class": "organelle_er"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/nanoparticle/images/1.png",
+        "prompt":"Please segment the regions of the ETEM images that correspond to supported gold nanoparticles.",
+        "class": "nanoparticle"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/ceramic/images/img942.png",
+        "prompt":"Please find and segment the regions that exhibit strong electronic correlation effects.",
+        "class": "ceramic_positive"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/ceramic/images/img942.png",
+        "prompt":"Please find and segment the regions in the image that have blurred boundaries and significantly different contrast.",
+        "class": "ceramic_negative"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/defect/images/image7.tiff",
+        "prompt":"Please segment the SeTe doped regions in the $$WSe_{2-2x}Te_{2x}$$ image.",
+        "class": "defect_1doped"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/defect/images/image7.tiff",
+        "prompt":"Please segment the defect lattice in the $$WSe_{2-2x}Te_{2x}$$ image associated with 2Te doping.",
+        "class": "defect_2doped"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/defect/images/image7.tiff",
+        "prompt":"Help me segment the areas in the $$WSe_{2-2x}Te_{2x}$$ image related to SV defects",
+        "class": "defect_1vacancy"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/defect/images/image7.tiff",
+        "prompt":"Analyze the $$WSe_{2-2x}Te_{2x}$$ image and segment the areas with DV defects.",
+        "class": "defect_2vacancy"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/micronet/EBC1/test/070516#1_S1160030.tif",
+        "prompt":"Help me segment the regions in the images that show interfacial cracks within the EBC coating.",
+        "class": "micronet_ebc_coat"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/micronet/EBC1/test/070516#1_S1160030.tif",
+        "prompt":"Help me segment the regions in the images that show interfacial cracks within the EBC coating.",
+        "class": "micronet_ebc_crack"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/micronet/Super1/test/spot2_0d_0.tif",
+        "prompt":"Please assist in segmenting the regions that exhibit characteristics of the secondary \\gamma' phase in the images.",
+        "class": "micronet_super_2precipitate"
+    },
+    {
+        "image":"/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/micronet/Super1/test/spot2_0d_0.tif",
+        "prompt":"Segment the tertiary precipitates formed during low-temperature aging in the Ni superalloy.",
+        "class": "micronet_super_3precipitate"
+    }
+]

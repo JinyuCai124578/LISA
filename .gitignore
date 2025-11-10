@@ -1,4 +1,8 @@
 **/__pycache__
 runs/
 .vscode/
-
+pretrained/
+*.out
+*.out_perf
+vis_output/
+lisa_params.pt

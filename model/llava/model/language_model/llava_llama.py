@@ -24,19 +24,26 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from ..llava_arch import LlavaMetaForCausalLM, LlavaMetaModel
 
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
 
 class LlavaConfig(LlamaConfig):
     model_type = "llava"
 
 
 class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
+    """
+    用于feature extractor的llm model
+    仅作为一个抽象的组合类，组合文本和图像在进入llm之前的特征处理过程
+    其中LlavaMetaModel用于注入额外的图像分支处理逻辑到feature extract逻辑中
+    """
     config_class = LlavaConfig
 
     def __init__(self, config: LlamaConfig):
         super(LlavaLlamaModel, self).__init__(config)
 
 
-class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
+class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM): # 多模态大模型的class
     config_class = LlavaConfig
 
     def __init__(self, config):
@@ -90,7 +97,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         )
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
 
-        outputs = self.model(
+        outputs = self.model( # 调用LlamaForCausalLM的forward进行普通LLM的前向传播
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -162,6 +169,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         )
         return model_inputs
 
-
+if "llava" in CONFIG_MAPPING._mapping:
+    # 移除模型类型
+    del CONFIG_MAPPING._mapping["llava"]
 AutoConfig.register("llava", LlavaConfig)
 AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)

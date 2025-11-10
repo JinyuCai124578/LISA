@@ -27,6 +27,11 @@ from .multimodal_encoder.builder import build_vision_tower
 
 
 class LlavaMetaModel:
+    """
+    负责图像分支的特征信息提取
+    第一个是通过vision encoder去得到图像特征
+    第二个是用projector将图像特征进行对齐
+    """
     def __init__(self, config):
         super(LlavaMetaModel, self).__init__(config)
 
@@ -83,6 +88,11 @@ class LlavaMetaModel:
 
 
 class LlavaMetaForCausalLM(ABC):
+    """
+    负责统筹特征提取和预测部分
+    其内部主要有实现图像特征提取encode_images()的逻辑（不涉及具体细节）和prepare_inputs_labels_for_multimodal()的逻辑
+    负责将图像的特征（来自于self.encode_images的调用）替换掉图像的占位符，构成完整的特征输入
+    """
     @abstractmethod
     def get_model(self):
         pass
@@ -98,8 +108,12 @@ class LlavaMetaForCausalLM(ABC):
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, attention_mask, past_key_values, labels, images
     ):
+        """将图片和文本embedding进行拼接"""
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
+            """
+            没有图像输入则直接返回
+            """
             if (
                 past_key_values is not None
                 and vision_tower is not None
@@ -114,6 +128,10 @@ class LlavaMetaForCausalLM(ABC):
             return input_ids, attention_mask, past_key_values, None, labels
 
         if type(images) is list or images.ndim == 5:
+            """
+            多个子图在新的维度上堆叠，使得images的dim等于5，或者以list形式组合子图
+            此条件下的特征提取对应于高分辨率的图像特征提取
+            """
             concat_images = torch.cat([image for image in images], dim=0)
             image_features = self.encode_images(concat_images)
             split_sizes = [image.shape[0] for image in images]
@@ -128,6 +146,7 @@ class LlavaMetaForCausalLM(ABC):
         for batch_idx, cur_input_ids in enumerate(input_ids):
             if (cur_input_ids == IMAGE_TOKEN_INDEX).sum() == 0:
                 # multimodal LLM, but the current sample is not multimodal
+                # 对文本token ids进行处理。按照图像占位符进行split，split得到的text token ids部分进行token_embed()
                 cur_input_embeds = self.get_model().embed_tokens(cur_input_ids)
                 cur_input_embeds = (
                     cur_input_embeds
@@ -140,6 +159,7 @@ class LlavaMetaForCausalLM(ABC):
                     new_labels.append(labels[batch_idx])
                 cur_image_idx += 1
                 continue
+            # 文本embedding和image feature进行拼接。将image feature来替换原有的占位符
             image_token_indices = torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0]
             cur_new_input_embeds = []
             if labels is not None:
@@ -207,11 +227,18 @@ class LlavaMetaForCausalLM(ABC):
                         )
                         cur_labels = cur_labels[image_token_start + 2 :]
                 else:
+                    """
+                    mm_use_im_start_end = True
+                    两边有开始和结束token
+                    """
                     cur_new_input_embeds.append(
-                        self.get_model().embed_tokens(cur_input_ids[:image_token_start])
+                        self.get_model().embed_tokens(cur_input_ids[:image_token_start]) 
+                        # get_model(): self.model=LlavaLlamaModel(config)
+                        # embed_tokens: LlamaModel的embed_tokens属性 (nn.Embedding)
                     )
                     cur_new_input_embeds.append(cur_image_features)
                     if labels is not None:
+                        # 更新labels
                         cur_new_labels.append(cur_labels[:image_token_start])
                         cur_new_labels.append(
                             torch.full(
@@ -220,7 +247,7 @@ class LlavaMetaForCausalLM(ABC):
                                 device=labels.device,
                                 dtype=labels.dtype,
                             )
-                        )
+                        ) # image token部分是IGNORE_INDEX
                         cur_labels = cur_labels[image_token_start + 1 :]
                 cur_image_idx += 1
                 if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(
@@ -249,6 +276,7 @@ class LlavaMetaForCausalLM(ABC):
                     )
                 if labels is not None:
                     cur_new_labels.append(cur_labels)
+            # 拼接
             cur_new_input_embeds = [
                 x.to(device=self.device) for x in cur_new_input_embeds
             ]
@@ -266,6 +294,7 @@ class LlavaMetaForCausalLM(ABC):
                 cur_new_embed = torch.cat(
                     (
                         cur_new_embed,
+                        # 保证序列长度相同
                         torch.zeros(
                             (max_len - cur_new_embed.shape[0], cur_new_embed.shape[1]),
                             dtype=cur_new_embed.dtype,
@@ -295,7 +324,7 @@ class LlavaMetaForCausalLM(ABC):
                     )
                     new_labels_align.append(cur_new_label)
                 new_labels = torch.stack(new_labels_align, dim=0)
-
+            # pad attention_mask 因为图像替换后序列长度增加
             if attention_mask is not None:
                 new_attention_mask = []
                 for cur_attention_mask, cur_new_labels, cur_new_labels_align in zip(

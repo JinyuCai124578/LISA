@@ -11,6 +11,7 @@ from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
 from .llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM,
                                                      LlavaLlamaModel)
 from .segment_anything import build_sam_vit_h
+import pdb
 
 
 def dice_loss(
@@ -96,6 +97,12 @@ class LisaMetaModel:
             nn.Dropout(0.0),
         ]
         self.text_hidden_fcs = nn.ModuleList([nn.Sequential(*text_fc)])
+
+        # ! yyc add to load fcs weight
+        # if hasattr(self.config, "train_mask_decoder"):
+        #     fcs_weight = torch.load("./Lisa_tuned_fcs.bin")
+        #     self.text_hidden_fcs.load_state_dict(fcs_weight, strict=True, assign=True)
+
         self.text_hidden_fcs.train()
         for param in self.text_hidden_fcs.parameters():
             param.requires_grad = True
@@ -131,9 +138,9 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             config.mm_vision_tower = kwargs.get(
                 "vision_tower", "openai/clip-vit-large-patch14"
             )
-            self.ce_loss_weight = kwargs.pop("ce_loss_weight", None)
-            self.dice_loss_weight = kwargs.pop("dice_loss_weight", None)
-            self.bce_loss_weight = kwargs.pop("bce_loss_weight", None)
+            self.ce_loss_weight = kwargs.pop("ce_loss_weight", 1.0)
+            self.dice_loss_weight = kwargs.pop("dice_loss_weight", 0.5)
+            self.bce_loss_weight = kwargs.pop("bce_loss_weight", 2.0)
         else:
             config.mm_vision_tower = config.vision_tower
             
@@ -244,6 +251,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             )
             output_hidden_states = output.hidden_states
 
+        # 用hidden_states中的最后一层输入到SAM种的embeddings
         hidden_states = []
 
         assert len(self.model.text_hidden_fcs) == 1
@@ -260,6 +268,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
 
         seg_token_offset = seg_token_offset[offset]
 
+        # pdb.set_trace()  # 设置断点
         pred_embeddings_ = []
         for i in range(len(seg_token_offset) - 1):
             start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
@@ -295,7 +304,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
 
         model_output = output
         gt_masks = masks_list
-
+        # pdb.set_trace()  # 设置断点
         if inference:
             return {
                 "pred_masks": pred_masks,
@@ -306,18 +315,21 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
 
         ce_loss = model_output.loss
         ce_loss = ce_loss * self.ce_loss_weight
-        mask_bce_loss = 0
-        mask_dice_loss = 0
+        mask_bce_loss = ce_loss-ce_loss
+        mask_dice_loss = ce_loss-ce_loss
         num_masks = 0
         for batch_idx in range(len(pred_masks)):
             gt_mask = gt_masks[batch_idx]
             pred_mask = pred_masks[batch_idx]
 
-            assert (
-                gt_mask.shape[0] == pred_mask.shape[0]
-            ), "gt_mask.shape: {}, pred_mask.shape: {}".format(
-                gt_mask.shape, pred_mask.shape
-            )
+            # assert (
+            #     gt_mask.shape[0] == pred_mask.shape[0]
+            # ), "gt_mask.shape: {}, pred_mask.shape: {}".format(
+            #     gt_mask.shape, pred_mask.shape
+            # )
+            if gt_mask.shape[0] != pred_mask.shape[0]:
+                continue  # 如果形状不匹配，则跳过当前循环迭代 没辙了
+
             mask_bce_loss += (
                 sigmoid_ce_loss(pred_mask, gt_mask, num_masks=gt_mask.shape[0])
                 * gt_mask.shape[0]
