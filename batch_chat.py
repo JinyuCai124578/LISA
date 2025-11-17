@@ -267,11 +267,15 @@ def main(args):
             save_img = cv2.cvtColor(save_img, cv2.COLOR_RGB2BGR)
             cv2.imwrite(save_path, save_img)
             print("{} has been saved.".format(save_path))
-        return
+        return {"image": image_path, "prompt": prompt, "class": class_name, "answer": text_output.split('ASSISTANT: ')[-1]}
     import json
     sample_dict = json.load(open("/home/bingxing2/ailab/caijinyu/LISA/chat_sample.json"))
+    result_json=[]
     for i in range(len(sample_dict)):
-        chat(sample_dict[i]["prompt"],sample_dict[i]["image"],sample_dict[i]["class"])
+        result=chat(sample_dict[i]["prompt"],sample_dict[i]["image"],sample_dict[i]["class"])
+        result_json.append(result)
+    with open(os.path.join(args.vis_save_path,"result.json"),"w") as f:
+        json.dump(result_json,f,indent=4)
 
 if __name__ == "__main__":
     main(sys.argv[1:])
