@@ -21,7 +21,7 @@ def parse_args(args):
         description="merge lora weights and save model with hf format"
     )
     parser.add_argument(
-        "--version", default="xinlai/LISA-13B-llama2-v1"
+        "--version", default="/mnt/shared-storage-user/caijinyu/model/models--xinlai--LISA-13B-llama2-v1/snapshots/b89000be11ad0a45512745a15063f2f6af1d9a5c/"
     )
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument(
@@ -31,12 +31,12 @@ def parse_args(args):
         choices=["fp32", "bf16", "fp16"],
         help="precision for inference",
     )
-    parser.add_argument("--vision_pretrained", default="/home/bingxing2/ailab/caijinyu/LISA/pretrained/sam_vit_h_4b8939.pth", type=str)
+    parser.add_argument("--vision_pretrained", default="/mnt/shared-storage-user/caijinyu/model/sam_vit_h_4b8939.pth", type=str)
     parser.add_argument("--out_dim", default=256, type=int)
     parser.add_argument("--image_size", default=1024, type=int, help="image size")
     parser.add_argument("--model_max_length", default=512, type=int)
     parser.add_argument(
-        "--vision-tower", default="openai/clip-vit-large-patch14", type=str
+        "--vision-tower", default="/mnt/shared-storage-user/caijinyu/model/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41", type=str
     )
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument("--lora_alpha", default=16, type=int)
@@ -54,7 +54,7 @@ def parse_args(args):
         choices=["llava_v1", "llava_llama_2"],
     )
     parser.add_argument("--weight", default="", type=str, required=False)
-    parser.add_argument("--save_path", default="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/lisa", type=str, required=False)
+    parser.add_argument("--save_path", default="/mnt/shared-storage-user/caijinyu/model", type=str, required=False)
     return parser.parse_args(args)
 
 
@@ -63,10 +63,9 @@ def main(args):
     os.makedirs(args.vis_save_path, exist_ok=True)
 
     # Create model
-    # Create model
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.version,
-        cache_dir="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/lisa",
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        "/mnt/shared-storage-user/caijinyu/model/models--xinlai--LISA-13B-llama2-v1/snapshots/b89000be11ad0a45512745a15063f2f6af1d9a5c",
+        # cache_dir="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/lisa",
         model_max_length=args.model_max_length,
         padding_side="right",
         use_fast=False,
@@ -108,7 +107,8 @@ def main(args):
         )
 
     model = LISAForCausalLM.from_pretrained(
-        args.version, low_cpu_mem_usage=True, vision_tower=args.vision_tower, seg_token_idx=args.seg_token_idx, **kwargs
+        "/mnt/shared-storage-user/caijinyu/model/models--xinlai--LISA-13B-llama2-v1/snapshots/b89000be11ad0a45512745a15063f2f6af1d9a5c",
+         low_cpu_mem_usage=True, vision_tower=args.vision_tower, seg_token_idx=args.seg_token_idx, **kwargs
     )
 
     model.config.eos_token_id = tokenizer.eos_token_id
@@ -145,17 +145,17 @@ def main(args):
     clip_image_processor = CLIPImageProcessor.from_pretrained(model.config.vision_tower)
     transform = ResizeLongestSide(args.image_size)
 
+    # parameter_keys = []
+    # # 保存所有parameter的key
+    # for n, p in model.named_parameters():
+    #     parameter_keys.append(n)
     
-    ####
-
-
-    state_dict = {}
-    for k, v in model.state_dict().items():
-        if "vision_tower" not in k:
-            state_dict[k] = v
-    model.save_pretrained(args.save_path, state_dict=state_dict)
-    tokenizer.save_pretrained(args.save_path)
-
+    # # save parameter_keys
+    # with open("lisa.txt", "w") as f:
+    #     for key in parameter_keys:
+    #         f.write("%s\n" % key)
+    named_parameters_dict = {name: param for name, param in model.named_parameters()}
+    torch.save(named_parameters_dict, "/mnt/shared-storage-user/caijinyu/model/lisa_params.pt")
 
 if __name__ == "__main__":
     main(sys.argv[1:])
