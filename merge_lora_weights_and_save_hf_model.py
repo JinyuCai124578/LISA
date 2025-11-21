@@ -13,6 +13,7 @@ from transformers import AutoTokenizer
 
 from model.LISA import LISAForCausalLM
 from utils.utils import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN
+from tqdm import tqdm
 
 
 def parse_args(args):
@@ -30,12 +31,12 @@ def parse_args(args):
         choices=["fp32", "bf16", "fp16"],
         help="precision for inference",
     )
-    parser.add_argument("--vision_pretrained", default="PATH_TO_SAM_ViT-H", type=str)
+    parser.add_argument("--vision_pretrained", default="/mnt/shared-storage-user/caijinyu/model/sam_vit_h_4b8939.pth", type=str)
     parser.add_argument("--out_dim", default=256, type=int)
     parser.add_argument("--image_size", default=1024, type=int, help="image size")
     parser.add_argument("--model_max_length", default=512, type=int)
     parser.add_argument(
-        "--vision-tower", default="openai/clip-vit-large-patch14", type=str
+        "--vision-tower", default="/mnt/shared-storage-user/caijinyu/model/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41", type=str
     )
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument("--lora_alpha", default=16, type=int)
@@ -52,6 +53,9 @@ def parse_args(args):
     )
     parser.add_argument("--weight", default="", type=str, required=True)
     parser.add_argument("--save_path", default="./lisa_model", type=str, required=True)
+    parser.add_argument("--train_from_scratch", action="store_true", default=False)
+    parser.add_argument('--train_mask_decoder_only', action='store_true', default=False)
+    parser.add_argument('--full_finetune', action='store_true', default=False)
     return parser.parse_args(args)
 
 
@@ -100,7 +104,9 @@ def main(args):
     vision_tower.to(dtype=torch_dtype)
     model.get_model().initialize_lisa_modules(model.get_model().config)
 
-    lora_r = args.lora_r
+    lora_r = args.lora_r if not args.train_mask_decoder_only else 0
+    if args.full_finetune:
+        lora_r = 0
     if lora_r > 0:
 
         def find_linear_layers(model, lora_target_modules):
@@ -142,6 +148,19 @@ def main(args):
         model.print_trainable_parameters()
 
     model.resize_token_embeddings(len(tokenizer))
+    if args.train_mask_decoder_only:
+        assert args.train_from_scratch == False, "train_from_scratch not supported when training mask decoder only"
+    if not args.train_from_scratch:
+        print("loading from pretrained")
+        lisa_params=torch.load('/mnt/shared-storage-user/caijinyu/model/lisa_params.pt', map_location='cuda')
+        for name, param in lisa_params.items():
+            # print(name)
+            name="base_model.model."+name
+            # pdb.set_trace()
+            if name in model.state_dict():
+                # print("load {}".format(name))
+                model.state_dict()[name].copy_(param)
+        del lisa_params
 
     # state_dict = torch.load(args.weight, map_location="cpu")
     # model.load_state_dict(state_dict, strict=True)
@@ -158,7 +177,7 @@ def main(args):
     shard_files = set(weight_map.values()) 
     full_state_dict = {}
 
-    for shard_file in shard_files:
+    for shard_file in tqdm(shard_files):
         shard_path = os.path.join(args.weight, shard_file)
         shard_state_dict = torch.load(shard_path, map_location="cpu")
         full_state_dict.update(shard_state_dict)
@@ -170,7 +189,8 @@ def main(args):
     """
     model.load_state_dict(full_state_dict, strict=True)
 
-    model = model.merge_and_unload()
+    if lora_r>0:
+        model = model.merge_and_unload()
     state_dict = {}
     for k, v in model.state_dict().items():
         if "vision_tower" not in k:

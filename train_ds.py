@@ -21,6 +21,7 @@ from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          intersectionAndUnionGPU)
 import pdb
 import traceback
+import torch.nn as nn
 
 def info(type, value, tb):
     traceback.print_exception(type, value, tb)
@@ -49,7 +50,7 @@ def parse_args(args):
     parser.add_argument("--model_max_length", default=512, type=int)
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument(
-        "--vision-tower", default="openai/clip-vit-large-patch14", type=str
+        "--vision-tower", default="/mnt/shared-storage-user/caijinyu/model/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41", type=str
     )
     parser.add_argument("--load_in_8bit", action="store_true", default=False)
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
@@ -70,7 +71,7 @@ def parse_args(args):
     parser.add_argument("--reason_seg_data", default="ReasonSeg|train", type=str)
     parser.add_argument("--val_dataset", default="ReasonSeg|val", type=str)
     parser.add_argument("--dataset_dir", default="./dataset", type=str)
-    parser.add_argument("--log_base_dir", default="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/runs", type=str)
+    parser.add_argument("--log_base_dir", default="/mnt/shared-storage-user/ai4sdata2-share/caijinyu/runs", type=str)
     parser.add_argument("--exp_name", default="lisa", type=str)
     parser.add_argument("--epochs", default=10, type=int)
     parser.add_argument("--steps_per_epoch", default=500, type=int)
@@ -116,6 +117,8 @@ def parse_args(args):
     parser.add_argument("--use_gpt_qa", action="store_true", default=False)
     parser.add_argument("--train_from_scratch", action="store_true", default=False)
     parser.add_argument('--train_mask_decoder_only', action='store_true', default=False)
+    parser.add_argument('--full_finetune', action='store_true', default=False)
+    parser.add_argument('--full_from_scratch', action='store_true', default=False)
     return parser.parse_args(args)
 
 
@@ -131,7 +134,7 @@ def main(args):
     # Create model
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.version,
-        cache_dir="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/lisa",
+        cache_dir="/mnt/shared-storage-user/caijinyu/model",
         model_max_length=args.model_max_length,
         padding_side="right",
         use_fast=False,
@@ -163,7 +166,7 @@ def main(args):
         torch_dtype = torch.half
     model = LISAForCausalLM.from_pretrained(
         args.version,
-        # cache_dir="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/lisa",
+        cache_dir="/mnt/shared-storage-user/caijinyu/model",
         torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
     )
     model.config.eos_token_id = tokenizer.eos_token_id
@@ -188,7 +191,9 @@ def main(args):
         args.conv_type
     ]
 
-    lora_r = args.lora_r
+    lora_r = args.lora_r if not args.train_mask_decoder_only else 0
+    if args.full_finetune or args.full_from_scratch:
+        lora_r = 0
     if lora_r > 0:
 
         def find_linear_layers(model, lora_target_modules):
@@ -218,7 +223,7 @@ def main(args):
         lora_target_modules = find_linear_layers(
             model, args.lora_target_modules.split(",")
         )
-        print("lora module",lora_target_modules)
+        # print("lora module",lora_target_modules)
         lora_config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
@@ -235,21 +240,47 @@ def main(args):
     # make text_hidden_fcs, mask_decoder, lm_head, embed_tokens trainable
     if args.train_mask_decoder_only:
         trainable_params=["mask_decoder"]
+        for n, p in model.named_parameters():
+            if any(
+                [
+                    x in n
+                    for x in trainable_params
+                ]
+            ):
+                print("n: ", n, "p.shape: ", p.shape)
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+    elif args.full_finetune:
+        for n, p in model.named_parameters():
+            p.requires_grad = True
+    elif args.full_from_scratch:
+        print('initialize all params')
+        for n, p in model.named_parameters():
+            p.requires_grad = True
+            # initialize
+            if len(p.shape) > 1:  # 如果是权重矩阵
+                nn.init.kaiming_uniform_(p, nonlinearity='relu')  # 或者使用 nn.init.kaiming_normal_
+            else:  # 如果是偏置
+                nn.init.zeros_(p)  # 偏置通常初始化为零，但你可以根据需要选择其他方法
+
     else:
         trainable_params=["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
-    for n, p in model.named_parameters():
-        if any(
-            [
-                x in n
-                for x in trainable_params
-            ]
-        ):
-            print("n: ", n, "p.shape: ", p.shape)
-            p.requires_grad = True
+        for n, p in model.named_parameters():
+            if any(
+                [
+                    x in n
+                    for x in trainable_params
+                ]
+            ):
+                # print("n: ", n, "p.shape: ", p.shape)
+                p.requires_grad = True
     # pdb.set_trace()
-    if not args.train_from_scratch:
+    if args.train_mask_decoder_only:
+        assert args.train_from_scratch == False, "train_from_scratch not supported when training mask decoder only"
+    if not args.train_from_scratch and not args.full_from_scratch:
         print("loading from pretrained")
-        lisa_params=torch.load('lisa_params.pt')
+        lisa_params=torch.load('/mnt/shared-storage-user/caijinyu/model/lisa_params.pt')
         for name, param in lisa_params.items():
             # print(name)
             name="base_model.model."+name
@@ -258,6 +289,12 @@ def main(args):
                 # print("load {}".format(name))
                 model.state_dict()[name].copy_(param)
         del lisa_params
+
+    # print all trainable parameters
+    print("##########")
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(name)
 
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1
@@ -338,12 +375,27 @@ def main(args):
         "gradient_clipping": 1.0,
         "zero_optimization": {
             "stage": 2,
-            "contiguous_gradients": True,
-            "overlap_comm": True,
-            "reduce_scatter": True,
-            "reduce_bucket_size": 5e8,
-            "allgather_bucket_size": 5e8,
+            "contiguous_gradients": True,  # 梯度连续存储，提升通信效率
+            "overlap_comm": True,         # 通信与计算重叠，减少等待时间
+            "reduce_scatter": True,       # 启用Reduce-Scatter优化
+            "reduce_bucket_size": 1e8,    # 100MB（原5e8过大，双卡需缩小）
+            "allgather_bucket_size": 1e8, # 100MB（匹配reduce_bucket_size）
+            "offload_optimizer": {        # 关键优化：卸载优化器状态到CPU
+                "device": "cpu",          # 显存不足时的救命配置
+                "pin_memory": True        # 锁定内存，加速CPU-GPU传输
+            }
         },
+        # "zero_optimization": {
+        #     "stage": 3,
+        #     "overlap_comm": True,          # 启用通信与计算重叠
+        #     "contiguous_gradients": True,  # 梯度连续内存布局
+        #     "reduce_bucket_size": 5e7,     # 200MB，适配PCIe/NVLink带宽
+        #     "stage3_prefetch_bucket_size": "auto",  # 自动预取参数
+        #     "stage3_param_persistence_threshold": 1e6,  # 1M参数持久化阈值
+        #     "stage3_max_live_parameters": 1e8,  # 300MB活跃参数上限
+        #     "stage3_max_reuse_distance": 1e8,   # 300MB重用距离
+        #     "stage3_gather_16bit_weights_on_model_save": True,  # 保存时合并权重
+        # },
     }
     model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
         model=model,
