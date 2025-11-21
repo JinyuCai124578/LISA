@@ -13,7 +13,9 @@ from model.llava import conversation as conversation_lib
 from model.llava.mm_utils import tokenizer_image_token
 from model.segment_anything.utils.transforms import ResizeLongestSide
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                         DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX)
+                         DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX, EXPLANATORY_QUESTION_LIST)
+import pdb
+import random
 
 os.environ['TRANSFORMERS_CACHE'] = '/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/cache'
 os.environ['HF_HOME'] = '/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/cache'
@@ -45,6 +47,7 @@ def parse_args(args):
         choices=["llava_v1", "llava_llama_2"],
     )
     parser.add_argument("--weight", default="", type=str, required=False)
+    parser.add_argument("--chat_json", default="/home/caijinyu/LISA/chat_sample.json", type=str, required=False)
     return parser.parse_args(args)
 
 
@@ -171,7 +174,7 @@ def main(args):
         conv = conversation_lib.conv_templates[args.conv_type].copy()
         conv.messages = []
 
-        prompt = DEFAULT_IMAGE_TOKEN + "\n" + prompt
+        prompt = DEFAULT_IMAGE_TOKEN + "\n" + prompt # + random.choice(EXPLANATORY_QUESTION_LIST)
         if args.use_mm_start_end:
             replace_token = (
                 DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
@@ -227,7 +230,7 @@ def main(args):
 
         input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
         input_ids = input_ids.unsqueeze(0).cuda()
-
+        pdb.set_trace()
         output_ids, pred_masks = model.evaluate(
             image_clip,
             image,
@@ -269,12 +272,13 @@ def main(args):
             print("{} has been saved.".format(save_path))
         return {"image": image_path, "prompt": prompt, "class": class_name, "answer": text_output.split('ASSISTANT: ')[-1]}
     import json
-    sample_dict = json.load(open("/home/bingxing2/ailab/caijinyu/LISA/chat_sample.json"))
+    sample_dict = json.load(open(args.chat_json))
     result_json=[]
     for i in range(len(sample_dict)):
         result=chat(sample_dict[i]["prompt"],sample_dict[i]["image"],sample_dict[i]["class"])
         result_json.append(result)
-    with open(os.path.join(args.vis_save_path,"result.json"),"w") as f:
+    result_save_path = os.path.join(args.vis_save_path,args.chat_json.split("/")[-1])
+    with open(result_save_path,"w") as f:
         json.dump(result_json,f,indent=4)
 
 if __name__ == "__main__":

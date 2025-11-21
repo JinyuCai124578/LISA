@@ -110,6 +110,8 @@ class LlavaMetaForCausalLM(ABC):
     ):
         """将图片和文本embedding进行拼接"""
         vision_tower = self.get_vision_tower()
+        # import pdb
+        # pdb.set_trace()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             """
             没有图像输入则直接返回

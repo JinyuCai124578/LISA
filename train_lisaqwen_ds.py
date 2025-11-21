@@ -16,7 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 from model.LISA import LISAForCausalLM
 from model.LISA_qwen import LISAQwenForCausalLM
 from model.llava import conversation as conversation_lib
-from utils.dataset import HybridDataset, ValDataset, collate_fn, ValDataset_EM
+from utils.dataset import HybridDataset, ValDataset, collate_fn, collate_fn_qwen, ValDataset_EM
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          AverageMeter, ProgressMeter, Summary, dict_to_cuda,
                          intersectionAndUnionGPU)
@@ -138,7 +138,17 @@ def main(args):
         padding_side="right",
         use_fast=False,
     )
-    tokenizer.pad_token = tokenizer.unk_token
+    if tokenizer.unk_token is not None:
+        tokenizer.pad_token = tokenizer.unk_token
+    else:
+        tokenizer.pad_token = "[PAD]"  # 设置默认填充标记
+
+    # 确保 pad_token 在词汇表中
+    if tokenizer.pad_token not in tokenizer.get_vocab():
+        tokenizer.add_special_tokens({"pad_token": tokenizer.pad_token})
+
+    # 设置 pad_token_id
+    tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
     num_added_tokens = tokenizer.add_tokens("[SEG]")
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
 
@@ -182,16 +192,16 @@ def main(args):
     model.enable_input_require_grads()
     model.gradient_checkpointing_enable()
 
-    model.get_model().initialize_vision_modules(model.get_model().config)
-    vision_tower = model.get_model().get_vision_tower()
-    vision_tower.to(dtype=torch_dtype, device=args.local_rank)
+    # model.get_model().initialize_vision_modules(model.get_model().config)
+    # vision_tower = model.get_model().get_vision_tower()
+    # vision_tower.to(dtype=torch_dtype, device=args.local_rank)
     if not args.eval_only:
-        model.get_model().initialize_lisa_modules(model.get_model().config)
+        model.lisa_model.initialize_lisa_modules(model.config)
 
-    for p in vision_tower.parameters():
-        p.requires_grad = False
-    for p in model.get_model().mm_projector.parameters():
-        p.requires_grad = False
+    # for p in vision_tower.parameters():
+    #     p.requires_grad = False
+    # for p in model.get_model().mm_projector.parameters():
+    #     p.requires_grad = False
 
     conversation_lib.default_conversation = conversation_lib.conv_templates[
         args.conv_type
@@ -361,7 +371,7 @@ def main(args):
         model_parameters=model.parameters(),
         training_data=train_dataset,
         collate_fn=partial(
-            collate_fn,
+            collate_fn_qwen,
             tokenizer=tokenizer,
             conv_type=args.conv_type,
             use_mm_start_end=args.use_mm_start_end,
@@ -403,7 +413,7 @@ def main(args):
             pin_memory=False,
             sampler=val_sampler,
             collate_fn=partial(
-                collate_fn,
+                collate_fn_qwen,
                 tokenizer=tokenizer,
                 conv_type=args.conv_type,
                 use_mm_start_end=args.use_mm_start_end,
@@ -420,6 +430,7 @@ def main(args):
 
     for epoch in range(args.start_epoch, args.epochs):
         # train for one epoch
+        # pdb.set_trace()
         train_iter = train(
             train_loader,
             model_engine,
@@ -429,7 +440,6 @@ def main(args):
             train_iter,
             args,
         )
-        pdb.set_trace()
 
         if args.no_eval == False:
             giou, ciou = validate(val_loader, model_engine, epoch, writer, args)

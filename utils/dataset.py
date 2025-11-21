@@ -10,9 +10,11 @@ from pycocotools import mask
 from transformers import CLIPImageProcessor
 
 from model.llava import conversation as conversation_lib
+from model.qwen import conversation as conversation_lib_qwen
 from model.llava.constants import (DEFAULT_IMAGE_TOKEN, IGNORE_INDEX,
                                    IMAGE_TOKEN_INDEX)
 from model.llava.mm_utils import tokenizer_image_token
+from model.qwen.mm_utils import tokenizer_image_token_qwen
 from model.segment_anything.utils.transforms import ResizeLongestSide
 
 from .conversation import get_default_conv_template
@@ -30,6 +32,7 @@ from .utils import (ANSWER_LIST, DEFAULT_IMAGE_TOKEN,
 from .vqa_dataset import VQADataset
 import json
 from PIL import Image
+import pdb
 
 def collate_fn(
     batch, tokenizer=None, conv_type="llava_v1", use_mm_start_end=True, local_rank=-1
@@ -164,7 +167,136 @@ def collate_fn(
         "conversation_list": conversation_list,
     }
 
+'''
+def collate_fn_qwen(
+    batch, tokenizer=None, conv_type="qwen", use_mm_start_end=True, local_rank=-1
+):
+    image_path_list = []
+    images_list = []
+    images_clip_list = []
+    conversation_list = []
+    masks_list = []
+    label_list = []
+    resize_list = []
+    questions_list = []
+    sampled_classes_list = []
+    offset_list = [0]
+    cnt = 0
+    inferences = []
+    for (
+        image_path,
+        images,
+        images_clip,
+        conversations,
+        masks,
+        label,
+        resize,
+        questions,
+        sampled_classes,
+        inference,
+    ) in batch:
+        image_path_list.append(image_path)
+        images_list.append(images)
+        images_clip_list.append(images_clip)
+        conversation_list.extend(conversations)
+        label_list.append(label)
+        masks_list.append(masks.float())
+        resize_list.append(resize)
+        questions_list.append(questions)
+        sampled_classes_list.append(sampled_classes)
+        cnt += len(conversations)
+        offset_list.append(cnt)
+        inferences.append(inference)
 
+    if use_mm_start_end:
+        # replace <image> token
+        for i in range(len(conversation_list)):
+            replace_token = "<|image_pad|>"
+            replace_token = "<|vision_start|>" + replace_token + "<|vision_end|>"
+            conversation_list[i] = conversation_list[i].replace("<image>", replace_token)
+
+    input_ids = [
+        tokenizer_image_token_qwen(prompt, tokenizer, return_tensors="pt")
+        for prompt in conversation_list
+    ]
+    input_ids = torch.nn.utils.rnn.pad_sequence(
+        input_ids, batch_first=True, padding_value=tokenizer.pad_token_id
+    )
+    attention_masks = input_ids.ne(tokenizer.pad_token_id)
+
+    conv = conversation_lib_qwen.default_conversation.copy()
+    targets = input_ids.clone()
+
+    if conv_type == "llava_v1":
+        sep = conv.sep + conv.roles[1] + ": "
+    elif conv_type == "qwen":
+        sep = conv.sep + conv.roles[1] + ": "
+    else:
+        sep = "[/INST] "
+    for conversation, target in zip(conversation_list, targets):
+        total_len = int(target.ne(tokenizer.pad_token_id).sum()) # 计算了目标张量中非 pad_token_id 的有效长度
+        rounds = conversation.split(conv.sep2) # 将对话拆分为轮次
+        cur_len = 1
+        target[:cur_len] = IGNORE_INDEX # 将目标张量的起始部分标记为 IGNORE_INDEX，忽略起始标记的损失。
+        for i, rou in enumerate(rounds):
+            if rou == "":
+                break
+
+            parts = rou.split(sep)
+            assert len(parts) == 2, (parts, rou)
+            parts[0] += sep
+
+            if "<|image_pad|>" in conversation:
+                round_len = len(tokenizer_image_token_qwen(rou, tokenizer))
+                instruction_len = len(tokenizer_image_token_qwen(parts[0], tokenizer)) - 2
+            else:
+                round_len = len(tokenizer(rou).input_ids)
+                instruction_len = len(tokenizer(parts[0]).input_ids) - 2
+
+            target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
+
+            cur_len += round_len
+        target[cur_len:] = IGNORE_INDEX
+
+        if False:
+            z = target.clone()
+            z = torch.where(z == IGNORE_INDEX, tokenizer.unk_token_id, z)
+            if local_rank == 0:
+                print(
+                    "conversation: ",
+                    conversation,
+                    "tokenizer.decode(z): ",
+                    tokenizer.decode(z),
+                )
+        # pdb.set_trace()
+        if cur_len < tokenizer.model_max_length:
+            assert cur_len == total_len, (cur_len, total_len) # AssertionError: (116, 117)
+
+    if inferences[0] == False:
+        truncate_len = tokenizer.model_max_length - 255
+
+        if input_ids.shape[1] > truncate_len:
+            input_ids = input_ids[:, :truncate_len]
+            targets = targets[:, :truncate_len]
+            attention_masks = attention_masks[:, :truncate_len]
+
+    return {
+        "image_paths": image_path_list,
+        "images": torch.stack(images_list, dim=0),
+        "images_clip": torch.stack(images_clip_list, dim=0),
+        "input_ids": input_ids,
+        "labels": targets,
+        "attention_masks": attention_masks,
+        "masks_list": masks_list,
+        "label_list": label_list,
+        "resize_list": resize_list,
+        "offset": torch.LongTensor(offset_list),
+        "questions_list": questions_list,
+        "sampled_classes_list": sampled_classes_list,
+        "inference": inferences[0],
+        "conversation_list": conversation_list,
+    }
+'''
 class HybridDataset(torch.utils.data.Dataset):
     pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
     pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)

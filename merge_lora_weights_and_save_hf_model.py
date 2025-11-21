@@ -13,6 +13,7 @@ from transformers import AutoTokenizer
 
 from model.LISA import LISAForCausalLM
 from utils.utils import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN
+from tqdm import tqdm
 
 
 def parse_args(args):
@@ -158,7 +159,7 @@ def main(args):
     shard_files = set(weight_map.values()) 
     full_state_dict = {}
 
-    for shard_file in shard_files:
+    for shard_file in tqdm(shard_files):
         shard_path = os.path.join(args.weight, shard_file)
         shard_state_dict = torch.load(shard_path, map_location="cpu")
         full_state_dict.update(shard_state_dict)
