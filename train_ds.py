@@ -16,9 +16,9 @@ from torch.utils.tensorboard import SummaryWriter
 from model.LISA import LISAForCausalLM
 from model.llava import conversation as conversation_lib
 from utils.dataset import HybridDataset, ValDataset, collate_fn, ValDataset_EM
-from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
+from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, IMAGE_TOKEN_INDEX, 
                          AverageMeter, ProgressMeter, Summary, dict_to_cuda,
-                         intersectionAndUnionGPU)
+                         intersectionAndUnionGPU, evaluate_text_metrics)
 import pdb
 import traceback
 import torch.nn as nn
@@ -119,6 +119,7 @@ def parse_args(args):
     parser.add_argument('--train_mask_decoder_only', action='store_true', default=False)
     parser.add_argument('--full_finetune', action='store_true', default=False)
     parser.add_argument('--full_from_scratch', action='store_true', default=False)
+    parser.add_argument('--score_text', action='store_true', default=False)
     return parser.parse_args(args)
 
 
@@ -456,7 +457,13 @@ def main(args):
     best_score, cur_ciou = 0.0, 0.0
 
     if args.eval_only:
-        giou, ciou = validate(val_loader, model_engine, 0, writer, args)
+        if args.score_text:
+            # import pdb; pdb.set_trace()
+            giou, ciou, text_metrics = validate_text(val_loader, model_engine, 0, writer, tokenizer, args)
+            print(giou,ciou,text_metrics)
+        else:
+            giou, ciou = validate(val_loader, model_engine, 0, writer, args)
+            text_metrics={}
         exit()
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -472,7 +479,11 @@ def main(args):
         )
 
         if args.no_eval == False:
-            giou, ciou = validate(val_loader, model_engine, epoch, writer, args)
+            if args.score_text:
+                giou, ciou, text_metrics = validate_text(val_loader, model_engine, epoch, writer, tokenizer, args)
+            else:
+                giou, ciou = validate(val_loader, model_engine, epoch, writer, args)
+                text_metrics={}
             is_best = giou > best_score
             best_score = max(giou, best_score)
             cur_ciou = ciou if is_best else cur_ciou
@@ -481,7 +492,7 @@ def main(args):
             save_dir = os.path.join(args.log_dir, "ckpt_model")
             if args.local_rank == 0:
                 torch.save(
-                    {"epoch": epoch},
+                    text_metrics.update({"epoch": epoch}),
                     os.path.join(
                         args.log_dir,
                         "meta_log_giou{:.3f}_ciou{:.3f}.pth".format(
@@ -675,6 +686,114 @@ def validate(val_loader, model_engine, epoch, writer, args):
 
     return giou, ciou
 
+
+def validate_text(val_loader, model_engine, epoch, writer, tokenizer, args):
+    '''
+    加入text相关指标
+    '''
+    intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
+    union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
+    acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
+    bleu_meter=AverageMeter("Bleu", ":6.3f", Summary.SUM)
+    cider_meter=AverageMeter("CIDEr", ":6.3f", Summary.SUM)
+    bertscorep_meter=AverageMeter("BERTScore_P", ":6.3f", Summary.SUM)
+    bertscorer_meter=AverageMeter("BERTScore_R", ":6.3f", Summary.SUM)
+    bertscoref1_meter=AverageMeter("BERTScore_F1", ":6.3f", Summary.SUM)
+
+
+    model_engine.eval()
+
+    for input_dict in tqdm.tqdm(val_loader):
+        torch.cuda.empty_cache()
+
+        input_dict = dict_to_cuda(input_dict)
+        if args.precision == "fp16":
+            input_dict["images"] = input_dict["images"].half()
+            input_dict["images_clip"] = input_dict["images_clip"].half()
+        elif args.precision == "bf16":
+            input_dict["images"] = input_dict["images"].bfloat16()
+            input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
+        else:
+            input_dict["images"] = input_dict["images"].float()
+            input_dict["images_clip"] = input_dict["images_clip"].float()
+
+        
+        for i in range(len(input_dict["input_ids"])):
+            
+            with torch.no_grad():
+                output_ids, pred_masks = model_engine.module.evaluate(
+                    input_dict["images_clip"],
+                    input_dict["images"],
+                    input_dict["input_ids"][i].unsqueeze(0),
+                    input_dict["resize_list"],
+                    # input_dict["resize_list"],
+                    [(input_dict["masks_list"][0].shape[1], input_dict["masks_list"][0].shape[2])],
+                    max_new_tokens=512,
+                    tokenizer=tokenizer,
+                )
+            
+            mask_i = input_dict["masks_list"][0][i].int()
+            output_i = (pred_masks[0][0] > 0).int()
+            output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
+            text_output = tokenizer.decode(output_ids, skip_special_tokens=False)
+            text_output = text_output.replace("\n", "").replace("  ", " ").replace('<unk>', '')
+            text_output = text_output.split('ASSISTANT: ')[-1]
+            text_output_gt = input_dict["conversation_list"][i].split('ASSISTANT: ')[-1] # todo
+            
+            
+            intersection, union, acc_iou = 0.0, 0.0, 0.0
+            intersection, union, _ = intersectionAndUnionGPU(
+                output_i.contiguous().clone(), mask_i.contiguous(), 2, ignore_index=255
+            )
+            acc_iou = intersection / (union + 1e-5) 
+            acc_iou[union == 0] += 1.0 
+            intersection, union = intersection.cpu().numpy(), union.cpu().numpy()
+            acc_iou = acc_iou.cpu().numpy()
+            intersection_meter.update(intersection)
+            union_meter.update(union)
+            acc_iou_meter.update(acc_iou, n=1)
+
+            # import pdb; pdb.set_trace()
+            text_metrics=evaluate_text_metrics(candidate=text_output, reference=text_output_gt)
+            bleu_meter.update(text_metrics['BLEU'])
+            cider_meter.update(text_metrics['CIDEr'])
+            bertscorep_meter.update(text_metrics['BERTScore_P'])
+            bertscorer_meter.update(text_metrics['BERTScore_R'])
+            bertscoref1_meter.update(text_metrics['BERTScore_F1'])
+
+    intersection_meter.all_reduce()
+    union_meter.all_reduce()
+    acc_iou_meter.all_reduce()
+    bleu_meter.all_reduce()
+    cider_meter.all_reduce()
+    bertscorep_meter.all_reduce()
+    bertscorer_meter.all_reduce()
+    bertscoref1_meter.all_reduce()
+
+    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
+    pdb.set_trace()
+    ciou = iou_class[1]
+    giou = acc_iou_meter.avg[1]
+
+    bleu= bleu_meter.avg
+    cider = cider_meter.avg
+    bertscorep = bertscorep_meter.avg
+    bertscorer = bertscorer_meter.avg
+    bertscoref1 = bertscoref1_meter.avg
+
+    if args.local_rank == 0:
+        writer.add_scalar("val/giou", giou, epoch)
+        writer.add_scalar("val/ciou", ciou, epoch)
+        writer.add_scalar("val/bleu", bleu, epoch)
+        writer.add_scalar("val/cider", cider, epoch)
+        writer.add_scalar("val/bertscorep", bertscorep, epoch)
+        writer.add_scalar("val/bertscorer", bertscorer, epoch)
+        writer.add_scalar("val/bertscoref1", bertscoref1, epoch)
+        print("giou: {:.4f}, ciou: {:.4f}".format(giou, ciou))
+        print("bleu: {:.4f}, cider: {:.4f}".format(bleu, cider))
+        print("bert score p: {:.4f}, r: {:.4f}, f1: {:.4f}".format(bertscorep, bertscorer, bertscoref1))
+
+    return giou, ciou, {'bleu': bleu, 'cider': cider, 'bert_score_p': bertscorep, 'bert_score_r': bertscorer, 'bert_score_f1': bertscoref1}
 
 if __name__ == "__main__":
     main(sys.argv[1:])

@@ -232,11 +232,11 @@ def main(args):
         # import pdb
         # pdb.set_trace()
         output_ids, pred_masks = model.evaluate(
-            image_clip,
-            image,
-            input_ids,
-            resize_list,
-            original_size_list,
+            image_clip, # torch.Size([1, 3, 224, 224])
+            image, # torch.Size([1, 3, 1024, 1024])
+            input_ids, # torch.Size([1, 76])
+            resize_list, #[(689, 1024)]
+            original_size_list, # [(3230, 4800)]
             max_new_tokens=512,
             tokenizer=tokenizer,
         )

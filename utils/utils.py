@@ -4,6 +4,11 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from pycocoevalcap.cider.cider import Cider
+from pycocoevalcap.spice.spice import Spice
+from bert_score import score as bert_score
+
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = -200
 DEFAULT_IMAGE_TOKEN = "<image>"
@@ -80,6 +85,7 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
     def all_reduce(self):
+        # 用于在分布式环境中同步指标
         device = "cuda" if torch.cuda.is_available() else "cpu"
         if isinstance(self.sum, np.ndarray):
             total = torch.tensor(
@@ -170,3 +176,110 @@ def dict_to_cuda(input_dict):
         ):
             input_dict[k] = [ele.cuda(non_blocking=True) for ele in v]
     return input_dict
+
+
+def calculate_bleu(candidate, references):
+    """
+    计算BLEU分数
+    
+    参数:
+        candidate: str - 生成的文本
+        references: list[str] - 参考文本列表
+        
+    返回:
+        float: BLEU分数 (0-1)
+    """
+    # 分词
+    candidate_tokens = candidate.split()
+    reference_tokens = [ref.split() for ref in references]
+    
+    # 使用平滑函数处理短句子
+    smoothing = SmoothingFunction().method1
+    
+    # 计算BLEU-4
+    score = sentence_bleu(reference_tokens, candidate_tokens, 
+                         smoothing_function=smoothing)
+    return score
+
+def calculate_cider(candidates, references):
+    """
+    计算CIDEr分数
+    
+    参数:
+        candidates: dict - {id: 生成的文本}
+        references: dict - {id: [参考文本列表]}
+        
+    返回:
+        float: CIDEr分数
+    """
+    scorer = Cider()
+    score, _ = scorer.compute_score(references, candidates)
+    return score
+
+def calculate_spice(candidates, references):
+    """
+    计算SPICE分数
+    
+    参数:
+        candidates: dict - {id: 生成的文本}
+        references: dict - {id: [参考文本列表]}
+        
+    返回:
+        float: SPICE分数 (0-1)
+    """
+    scorer = Spice()
+    score, _ = scorer.compute_score(references, candidates)
+    return score
+
+def calculate_bertscore(candidates, references, lang="en"):
+    """
+    计算BERTScore
+    
+    参数:
+        candidates: list[str] - 生成的文本列表
+        references: list[str] - 参考文本列表
+        lang: str - 语言代码
+        
+    返回:
+        tuple: (精确率, 召回率, F1)
+    """
+    P, R, F1 = bert_score(candidates, references, lang=lang , 
+                            model_type="/mnt/shared-storage-user/caijinyu/model/models--roberta-large/snapshots/722cf37b1afa9454edce342e7895e588b6ff1d59/",
+                            num_layers=17)
+    return P.mean().item(), R.mean().item(), F1.mean().item()
+
+def evaluate_text_metrics(candidate, reference, candidate_id="1"):
+    """
+    综合计算所有指标
+    
+    参数:
+        candidate: str - 生成的文本
+        reference: str - 参考文本
+        candidate_id: str - 文本ID
+        
+    返回:
+        dict: 包含所有指标的字典
+    """
+    # import pdb; pdb.set_trace()
+    references=[reference]
+    # BLEU
+    bleu = calculate_bleu(candidate, references)
+    
+    # CIDEr
+    cider_score = calculate_cider({candidate_id: [candidate]}, {candidate_id: references})
+    
+    # SPICE
+    # spice_result = calculate_spice({candidate_id: candidate}, {candidate_id: references})
+    # spice = spice_result['All']['f']
+    
+    # BERTScore
+    bert_P, bert_R, bert_F1 = calculate_bertscore([candidate], references)
+    
+    return {
+        "BLEU": bleu,
+        "CIDEr": cider_score,
+        # "SPICE": spice,
+        "BERTScore_P": bert_P,
+        "BERTScore_R": bert_R,
+        "BERTScore_F1": bert_F1
+    }
