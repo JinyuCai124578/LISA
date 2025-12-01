@@ -8,8 +8,8 @@ from transformers import BitsAndBytesConfig, CLIPVisionModel
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          DEFAULT_IMAGE_PATCH_TOKEN)
 
-from .llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM,
-                                                     LlavaLlamaModel)
+from .llava.model.language_model.llava_qwen import (LlavaQwenForCausalLM,
+                                                   LlavaQwenModel)
 from .segment_anything import build_sam_vit_h, build_sam_vit_l
 import pdb
 
@@ -60,13 +60,13 @@ def sigmoid_ce_loss(
     return loss
 
 
-class LisaMetaModel:
+class LisaQwenMetaModel:
     def __init__(
         self,
         config,
         **kwargs,
     ):
-        super(LisaMetaModel, self).__init__(config) # why is this necessary?
+        super(LisaQwenMetaModel, self).__init__(config) # why is this necessary?
 
         self.config = config
         if not hasattr(self.config, "train_mask_decoder"):
@@ -114,13 +114,13 @@ class LisaMetaModel:
             param.requires_grad = True
 
 
-class LisaModel(LisaMetaModel, LlavaLlamaModel):
+class LisaQwenModel(LisaQwenMetaModel, LlavaQwenModel):
     def __init__(
         self,
         config,
         **kwargs,
     ):
-        super(LisaModel, self).__init__(config, **kwargs)
+        super(LisaQwenModel, self).__init__(config, **kwargs)
 
         self.config.use_cache = False
         self.config.vision_tower = self.config.mm_vision_tower
@@ -133,7 +133,7 @@ class LisaModel(LisaMetaModel, LlavaLlamaModel):
         self.config.mm_use_im_patch_token = False
 
 
-class LISAForCausalLM(LlavaLlamaForCausalLM):
+class LISAQwenForCausalLM(LlavaQwenForCausalLM):
     def __init__(
         self,
         config,
@@ -154,7 +154,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
 
         super().__init__(config)
 
-        self.model = LisaModel(config, **kwargs)
+        self.model = LisaQwenModel(config, **kwargs)
 
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -199,19 +199,19 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         assert batch_size == len(offset) - 1
         
         # 处理文本输入 seg_token_mask 用于标记哪些 token 是分割相关的特殊 token
-        seg_token_mask = input_ids[:, 1:] == self.seg_token_idx # (3,153)
+        seg_token_mask = input_ids[:, 1:] == self.seg_token_idx
         seg_token_mask = torch.cat(
             [
                 seg_token_mask,
                 torch.zeros((seg_token_mask.shape[0], 1)).bool().cuda(),
             ],
             dim=1,
-        ) # (3,154)
+        )
         # hack for IMAGE_TOKEN_INDEX (we suppose that there is only one image, and it is in the front)
         seg_token_mask = torch.cat(
             [torch.zeros((seg_token_mask.shape[0], 255)).bool().cuda(), seg_token_mask],
             dim=1,
-        ) # (3,154+255=409)
+        )
 
         if inference:
             #  调用父类的 forward 方法，生成文本的隐藏状态。最终将隐藏状态存储在 output_hidden_states 中
@@ -265,11 +265,15 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         hidden_states = []
 
         assert len(self.model.text_hidden_fcs) == 1
-        hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states[-1])) # [3, 409, 5120] → [3, 409, 256]
+        hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states[-1]))
 
         last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
-        import pdb; pdb.set_trace()
-        pred_embeddings = last_hidden_state[seg_token_mask] # [3, 409, 256], [3, 409]
+        # hack for IMAGE_TOKEN_INDEX (we suppose that there is only one image, and it is in the front) 不止255
+        seg_token_mask = torch.cat(
+            [torch.zeros((seg_token_mask.shape[0], last_hidden_state.shape[1]-seg_token_mask.shape[1])).bool().cuda(), seg_token_mask],
+            dim=1,
+        )
+        pred_embeddings = last_hidden_state[seg_token_mask] # [1, 839, 256], [2, 368]
         seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
 
         seg_token_offset = seg_token_counts.cumsum(-1)

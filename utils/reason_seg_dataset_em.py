@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import CLIPImageProcessor
+from model.llava.model.multimodal_encoder.siglip_encoder import SigLipImageProcessor, SigLipVisionTower
 
 from model.llava import conversation as conversation_lib
 from model.segment_anything.utils.transforms import ResizeLongestSide
@@ -52,7 +53,10 @@ class ReasonSegDataset_EM(torch.utils.data.Dataset):
         self.tokenizer = tokenizer
         self.precision = precision
         self.transform = ResizeLongestSide(image_size)
-        self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
+        if "clip" in vision_tower:
+            self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
+        elif "siglip" in vision_tower:
+            self.clip_image_processor = SigLipVisionTower(vision_tower).image_processor
 
         self.short_question_list = SHORT_QUESTION_LIST
         self.long_question_list = LONG_QUESTION_LIST
@@ -109,6 +113,7 @@ class ReasonSegDataset_EM(torch.utils.data.Dataset):
         # preprocess image for clip
         # if np.max(image)>1 or np.min(image)<0:
         #     image = (image-np.min(image))/(np.max(image)-np.min(image))
+        # print('in dataset:',image.shape, type(image)) # in dataset: (1024, 1024, 3) <class 'numpy.ndarray'>
         image_clip = self.clip_image_processor.preprocess(image, return_tensors="pt")[
             "pixel_values"
         ][0]

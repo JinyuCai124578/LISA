@@ -1,3 +1,6 @@
+'''
+定义了一个 Conversation 类，用于管理对话历史和生成对话的文本表示。它支持多种分隔符样式（SeparatorStyle），并根据不同的对话模板生成适配的对话格式
+'''
 import dataclasses
 from enum import Enum, auto
 from typing import List, Tuple
@@ -11,7 +14,7 @@ class SeparatorStyle(Enum):
     MPT = auto()
     PLAIN = auto()
     LLAMA_2 = auto()
-    CHATML = auto()
+    QWEN=auto()
 
 
 @dataclasses.dataclass
@@ -34,6 +37,7 @@ class Conversation:
         if len(messages) > 0 and type(messages[0][1]) is tuple:
             messages = self.messages.copy()
             init_role, init_msg = messages[0].copy()
+            ### todo
             init_msg = init_msg[0].replace("<image>", "").strip()
             if "mmtag" in self.version:
                 messages[0] = (init_role, init_msg)
@@ -102,17 +106,16 @@ class Conversation:
                     ret += message + seps[i % 2]
                 else:
                     ret += ""
-        elif self.sep_style == SeparatorStyle.CHATML:
-            ret = "" if self.system == "" else self.system + self.sep + "\n"
-            for role, message in messages:
+        elif self.sep_style == SeparatorStyle.QWEN:
+            ### todo
+            ret = self.system + self.sep
+            for i, (role, message) in enumerate(messages):
                 if message:
                     if type(message) is tuple:
-                        message, images, _ = message
-                        message = "<image>" * len(images) + message
-                    ret += role + "\n" + message + self.sep + "\n"
+                        message, _, _ = message
+                    ret += role + ": " + message + self.sep
                 else:
-                    ret += role + "\n"
-            return ret
+                    ret += role + ":"
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
 
@@ -181,6 +184,7 @@ class Conversation:
         return images
 
     def to_gradio_chatbot(self):
+        '''转换为 Gradio 格式'''
         ret = []
         for i, (role, msg) in enumerate(self.messages[self.offset :]):
             if i % 2 == 0:
@@ -388,31 +392,21 @@ conv_llava_v1_mmtag = Conversation(
     sep2="</s>",
     version="v1_mmtag",
 )
-conv_qwen = Conversation(
-    system="""<|im_start|>system
-You are a helpful assistant.""",
-    roles=("<|im_start|>user", "<|im_start|>assistant"),
-    version="qwen",
-    messages=[],
+
+### todo: visual token, sep token, version(?)
+conv_qwen_vl = Conversation(
+    system="A chat between a curious user and an artificial intelligence assistant. "
+    "The assistant is able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language."
+    "The visual content will be provided with the following format: <Image>visual content</Image>.",
+    roles=("USER", "ASSISTANT"),
+    messages=(),
     offset=0,
-    sep_style=SeparatorStyle.CHATML, # warning
-    sep="<|im_end|>",
-    sep2="<|im_end|> ",
+    sep_style=SeparatorStyle.TWO,
+    sep=" ",
+    sep2="</s>",
 )
 
-conv_qwen_2_5 = Conversation(
-    system="""<|im_start|>system
-You are Qwen, created by Alibaba Cloud. You are a helpful assistant.""",
-    roles=("<|im_start|>user", "<|im_start|>assistant"),
-    version="qwen",
-    messages=[],
-    offset=0,
-    sep_style=SeparatorStyle.CHATML,
-    sep="<|im_end|>",
-)
-
-
-default_conversation = conv_vicuna_v0
+default_conversation = conv_qwen_vl
 conv_templates = {
     "default": conv_vicuna_v0,
     "v0": conv_vicuna_v0,
@@ -427,9 +421,7 @@ conv_templates = {
     "v1_mmtag": conv_llava_v1_mmtag,
     "llava_llama_2": conv_llava_llama_2,
     "mpt": conv_mpt,
-    "qwen_1_5": conv_qwen,
-    "qwen_2": conv_qwen,
-    "qwen_2_5": conv_qwen_2_5,
+    "qwen_vl": conv_qwen_vl,
 }
 
 
