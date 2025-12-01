@@ -98,13 +98,15 @@ def collate_fn(
 
     if conv_type == "llava_v1":
         sep = conv.sep + conv.roles[1] + ": "
+    elif conv_type == "qwen_2":
+        sep = conv.roles[1]
     else:
         sep = "[/INST] "
     for conversation, target in zip(conversation_list, targets):
         total_len = int(target.ne(tokenizer.pad_token_id).sum())
 
         rounds = conversation.split(conv.sep2)
-        cur_len = 1
+        cur_len = 1 if conv_type == "llava_v1" else 0 # warning
         target[:cur_len] = IGNORE_INDEX
         for i, rou in enumerate(rounds):
             if rou == "":
@@ -113,7 +115,7 @@ def collate_fn(
             parts = rou.split(sep)
             # if len(parts) != 2:
             #     break
-            assert len(parts) == 2, (len(parts), rou)
+            assert len(parts) == 2, (len(parts), rou, sep)
             parts[0] += sep
 
             if DEFAULT_IMAGE_TOKEN in conversation:
@@ -140,7 +142,7 @@ def collate_fn(
                 )
 
         if cur_len < tokenizer.model_max_length:
-            assert cur_len == total_len
+            assert cur_len == total_len, (cur_len, total_len)
 
     if inferences[0] == False:
         truncate_len = tokenizer.model_max_length - 255

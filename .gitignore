@@ -6,3 +6,6 @@ pretrained/
 *.out_perf
 vis_output/
 lisa_params.pt
+*.log
+*.sh
+*.json

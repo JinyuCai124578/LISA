@@ -14,14 +14,15 @@ from peft import LoraConfig, get_peft_model
 from torch.utils.tensorboard import SummaryWriter
 
 from model.LISA import LISAForCausalLM
-from model.LISA_qwen import LISAQwenForCausalLM
+# from model.LISA_qwen import LISAQwenForCausalLM
 from model.llava import conversation as conversation_lib
 from utils.dataset import HybridDataset, ValDataset, collate_fn, ValDataset_EM
-from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
+from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, IMAGE_TOKEN_INDEX, 
                          AverageMeter, ProgressMeter, Summary, dict_to_cuda,
-                         intersectionAndUnionGPU)
+                         intersectionAndUnionGPU, evaluate_text_metrics)
 import pdb
 import traceback
+import torch.nn as nn
 
 def info(type, value, tb):
     traceback.print_exception(type, value, tb)
@@ -50,7 +51,7 @@ def parse_args(args):
     parser.add_argument("--model_max_length", default=512, type=int)
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument(
-        "--vision-tower", default="openai/clip-vit-large-patch14", type=str
+        "--vision-tower", default="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41", type=str
     )
     parser.add_argument("--load_in_8bit", action="store_true", default=False)
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
@@ -117,7 +118,9 @@ def parse_args(args):
     parser.add_argument("--use_gpt_qa", action="store_true", default=False)
     parser.add_argument("--train_from_scratch", action="store_true", default=False)
     parser.add_argument('--train_mask_decoder_only', action='store_true', default=False)
-    parser.add_argument('--vlm_model', default='llava', type=str, choices=['llava', 'qwen'])
+    parser.add_argument('--full_finetune', action='store_true', default=False)
+    parser.add_argument('--full_from_scratch', action='store_true', default=False)
+    parser.add_argument('--score_text', action='store_true', default=False)
     return parser.parse_args(args)
 
 
@@ -163,18 +166,11 @@ def main(args):
         torch_dtype = torch.bfloat16
     elif args.precision == "fp16":
         torch_dtype = torch.half
-    if args.vlm_model=='llava':
-        model = LISAForCausalLM.from_pretrained(
-            args.version,
-            # cache_dir="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/lisa",
-            torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
-        )
-    elif args.vlm_model=='qwen':
-        model = LISAQwenForCausalLM.from_pretrained(
-            args.version,
-            # cache_dir="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/qwen",
-            torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
-        )
+    model = LISAForCausalLM.from_pretrained(
+        args.version,
+        # cache_dir="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/lisa",
+        torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
+    )
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -198,6 +194,8 @@ def main(args):
     ]
 
     lora_r = args.lora_r if not args.train_mask_decoder_only else 0
+    if args.full_finetune or args.full_from_scratch or args.eval_only:
+        lora_r = 0
     if lora_r > 0:
 
         def find_linear_layers(model, lora_target_modules):
@@ -227,7 +225,7 @@ def main(args):
         lora_target_modules = find_linear_layers(
             model, args.lora_target_modules.split(",")
         )
-        print("lora module",lora_target_modules)
+        # print("lora module",lora_target_modules)
         lora_config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
@@ -244,23 +242,47 @@ def main(args):
     # make text_hidden_fcs, mask_decoder, lm_head, embed_tokens trainable
     if args.train_mask_decoder_only:
         trainable_params=["mask_decoder"]
+        for n, p in model.named_parameters():
+            if any(
+                [
+                    x in n
+                    for x in trainable_params
+                ]
+            ):
+                print("n: ", n, "p.shape: ", p.shape)
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+    elif args.full_finetune:
+        for n, p in model.named_parameters():
+            p.requires_grad = True
+    elif args.full_from_scratch:
+        print('initialize all params')
+        for n, p in model.named_parameters():
+            p.requires_grad = True
+            # initialize
+            if len(p.shape) > 1:  # 如果是权重矩阵
+                nn.init.kaiming_uniform_(p, nonlinearity='relu')  # 或者使用 nn.init.kaiming_normal_
+            else:  # 如果是偏置
+                nn.init.zeros_(p)  # 偏置通常初始化为零，但你可以根据需要选择其他方法
+
     else:
         trainable_params=["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
-    for n, p in model.named_parameters():
-        if any(
-            [
-                x in n
-                for x in trainable_params
-            ]
-        ):
-            print("n: ", n, "p.shape: ", p.shape)
-            p.requires_grad = True
+        for n, p in model.named_parameters():
+            if any(
+                [
+                    x in n
+                    for x in trainable_params
+                ]
+            ):
+                # print("n: ", n, "p.shape: ", p.shape)
+                p.requires_grad = True
     # pdb.set_trace()
     if args.train_mask_decoder_only:
         assert args.train_from_scratch == False, "train_from_scratch not supported when training mask decoder only"
-    if not args.train_from_scratch:
+    if not args.train_from_scratch and not args.full_from_scratch:
         print("loading from pretrained")
-        lisa_params=torch.load('lisa_params.pt')
+        lisa_params=torch.load('/mnt/shared-storage-user/caijinyu/model/lisa_params.pt')
         for name, param in lisa_params.items():
             # print(name)
             name="base_model.model."+name
@@ -269,6 +291,12 @@ def main(args):
                 # print("load {}".format(name))
                 model.state_dict()[name].copy_(param)
         del lisa_params
+
+    # print all trainable parameters
+    print("##########")
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(name)
 
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1
@@ -415,7 +443,13 @@ def main(args):
     best_score, cur_ciou = 0.0, 0.0
 
     if args.eval_only:
-        giou, ciou = validate(val_loader, model_engine, 0, writer, args)
+        if args.score_text:
+            # import pdb; pdb.set_trace()
+            giou, ciou, text_metrics = validate_text(val_loader, model_engine, 0, writer, tokenizer, args)
+            print(giou,ciou,text_metrics)
+        else:
+            giou, ciou = validate(val_loader, model_engine, 0, writer, args)
+            text_metrics={}
         exit()
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -432,7 +466,11 @@ def main(args):
         pdb.set_trace()
 
         if args.no_eval == False:
-            giou, ciou = validate(val_loader, model_engine, epoch, writer, args)
+            if args.score_text:
+                giou, ciou, text_metrics = validate_text(val_loader, model_engine, epoch, writer, tokenizer, args)
+            else:
+                giou, ciou = validate(val_loader, model_engine, epoch, writer, args)
+                text_metrics={}
             is_best = giou > best_score
             best_score = max(giou, best_score)
             cur_ciou = ciou if is_best else cur_ciou
@@ -441,7 +479,7 @@ def main(args):
             save_dir = os.path.join(args.log_dir, "ckpt_model")
             if args.local_rank == 0:
                 torch.save(
-                    {"epoch": epoch},
+                    text_metrics.update({"epoch": epoch}),
                     os.path.join(
                         args.log_dir,
                         "meta_log_giou{:.3f}_ciou{:.3f}.pth".format(
@@ -635,6 +673,114 @@ def validate(val_loader, model_engine, epoch, writer, args):
 
     return giou, ciou
 
+
+def validate_text(val_loader, model_engine, epoch, writer, tokenizer, args):
+    '''
+    加入text相关指标
+    '''
+    intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
+    union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
+    acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
+    bleu_meter=AverageMeter("Bleu", ":6.3f", Summary.SUM)
+    cider_meter=AverageMeter("CIDEr", ":6.3f", Summary.SUM)
+    bertscorep_meter=AverageMeter("BERTScore_P", ":6.3f", Summary.SUM)
+    bertscorer_meter=AverageMeter("BERTScore_R", ":6.3f", Summary.SUM)
+    bertscoref1_meter=AverageMeter("BERTScore_F1", ":6.3f", Summary.SUM)
+
+
+    model_engine.eval()
+
+    for input_dict in tqdm.tqdm(val_loader):
+        torch.cuda.empty_cache()
+
+        input_dict = dict_to_cuda(input_dict)
+        if args.precision == "fp16":
+            input_dict["images"] = input_dict["images"].half()
+            input_dict["images_clip"] = input_dict["images_clip"].half()
+        elif args.precision == "bf16":
+            input_dict["images"] = input_dict["images"].bfloat16()
+            input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
+        else:
+            input_dict["images"] = input_dict["images"].float()
+            input_dict["images_clip"] = input_dict["images_clip"].float()
+
+        
+        for i in range(len(input_dict["input_ids"])):
+            
+            with torch.no_grad():
+                output_ids, pred_masks = model_engine.module.evaluate(
+                    input_dict["images_clip"],
+                    input_dict["images"],
+                    input_dict["input_ids"][i].unsqueeze(0),
+                    input_dict["resize_list"],
+                    # input_dict["resize_list"],
+                    [(input_dict["masks_list"][0].shape[1], input_dict["masks_list"][0].shape[2])],
+                    max_new_tokens=512,
+                    tokenizer=tokenizer,
+                )
+            
+            mask_i = input_dict["masks_list"][0][i].int()
+            output_i = (pred_masks[0][0] > 0).int()
+            output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
+            text_output = tokenizer.decode(output_ids, skip_special_tokens=False)
+            text_output = text_output.replace("\n", "").replace("  ", " ").replace('<unk>', '')
+            text_output = text_output.split('ASSISTANT: ')[-1]
+            text_output_gt = input_dict["conversation_list"][i].split('ASSISTANT: ')[-1] # todo
+            
+            
+            intersection, union, acc_iou = 0.0, 0.0, 0.0
+            intersection, union, _ = intersectionAndUnionGPU(
+                output_i.contiguous().clone(), mask_i.contiguous(), 2, ignore_index=255
+            )
+            acc_iou = intersection / (union + 1e-5) 
+            acc_iou[union == 0] += 1.0 
+            intersection, union = intersection.cpu().numpy(), union.cpu().numpy()
+            acc_iou = acc_iou.cpu().numpy()
+            intersection_meter.update(intersection)
+            union_meter.update(union)
+            acc_iou_meter.update(acc_iou, n=1)
+
+            # import pdb; pdb.set_trace()
+            text_metrics=evaluate_text_metrics(candidate=text_output, reference=text_output_gt)
+            bleu_meter.update(text_metrics['BLEU'])
+            cider_meter.update(text_metrics['CIDEr'])
+            bertscorep_meter.update(text_metrics['BERTScore_P'])
+            bertscorer_meter.update(text_metrics['BERTScore_R'])
+            bertscoref1_meter.update(text_metrics['BERTScore_F1'])
+
+    intersection_meter.all_reduce()
+    union_meter.all_reduce()
+    acc_iou_meter.all_reduce()
+    bleu_meter.all_reduce()
+    cider_meter.all_reduce()
+    bertscorep_meter.all_reduce()
+    bertscorer_meter.all_reduce()
+    bertscoref1_meter.all_reduce()
+
+    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
+    pdb.set_trace()
+    ciou = iou_class[1]
+    giou = acc_iou_meter.avg[1]
+
+    bleu= bleu_meter.avg
+    cider = cider_meter.avg
+    bertscorep = bertscorep_meter.avg
+    bertscorer = bertscorer_meter.avg
+    bertscoref1 = bertscoref1_meter.avg
+
+    if args.local_rank == 0:
+        writer.add_scalar("val/giou", giou, epoch)
+        writer.add_scalar("val/ciou", ciou, epoch)
+        writer.add_scalar("val/bleu", bleu, epoch)
+        writer.add_scalar("val/cider", cider, epoch)
+        writer.add_scalar("val/bertscorep", bertscorep, epoch)
+        writer.add_scalar("val/bertscorer", bertscorer, epoch)
+        writer.add_scalar("val/bertscoref1", bertscoref1, epoch)
+        print("giou: {:.4f}, ciou: {:.4f}".format(giou, ciou))
+        print("bleu: {:.4f}, cider: {:.4f}".format(bleu, cider))
+        print("bert score p: {:.4f}, r: {:.4f}, f1: {:.4f}".format(bertscorep, bertscorer, bertscoref1))
+
+    return giou, ciou, {'bleu': bleu, 'cider': cider, 'bert_score_p': bertscorep, 'bert_score_r': bertscorer, 'bert_score_f1': bertscoref1}
 
 if __name__ == "__main__":
     main(sys.argv[1:])

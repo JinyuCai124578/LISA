@@ -34,7 +34,7 @@ def parse_args(args):
     parser.add_argument("--model_max_length", default=512, type=int)
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument(
-        "--vision-tower", default="openai/clip-vit-large-patch14", type=str
+        "--vision-tower", default="/mnt/shared-storage-user/caijinyu/model/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41", type=str
     )
     parser.add_argument("--local-rank", default=0, type=int, help="node rank")
     parser.add_argument("--load_in_8bit", action="store_true", default=False)
@@ -47,6 +47,7 @@ def parse_args(args):
         choices=["llava_v1", "llava_llama_2"],
     )
     parser.add_argument("--weight", default="", type=str, required=False)
+    parser.add_argument("--chat_json", default="/home/caijinyu/LISA/chat_sample.json", type=str, required=False)
     parser.add_argument("--chat_json", default="/home/caijinyu/LISA/chat_sample.json", type=str, required=False)
     return parser.parse_args(args)
 
@@ -174,6 +175,7 @@ def main(args):
         conv = conversation_lib.conv_templates[args.conv_type].copy()
         conv.messages = []
 
+        prompt = DEFAULT_IMAGE_TOKEN + "\n" + prompt + random.choice(EXPLANATORY_QUESTION_LIST)
         prompt = DEFAULT_IMAGE_TOKEN + "\n" + prompt # + random.choice(EXPLANATORY_QUESTION_LIST)
         if args.use_mm_start_end:
             replace_token = (
@@ -230,13 +232,14 @@ def main(args):
 
         input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
         input_ids = input_ids.unsqueeze(0).cuda()
-        pdb.set_trace()
+        # import pdb
+        # pdb.set_trace()
         output_ids, pred_masks = model.evaluate(
-            image_clip,
-            image,
-            input_ids,
-            resize_list,
-            original_size_list,
+            image_clip, # torch.Size([1, 3, 224, 224])
+            image, # torch.Size([1, 3, 1024, 1024])
+            input_ids, # torch.Size([1, 76])
+            resize_list, #[(689, 1024)]
+            original_size_list, # [(3230, 4800)]
             max_new_tokens=512,
             tokenizer=tokenizer,
         )
@@ -277,6 +280,7 @@ def main(args):
     for i in range(len(sample_dict)):
         result=chat(sample_dict[i]["prompt"],sample_dict[i]["image"],sample_dict[i]["class"])
         result_json.append(result)
+    
     result_save_path = os.path.join(args.vis_save_path,args.chat_json.split("/")[-1])
     with open(result_save_path,"w") as f:
         json.dump(result_json,f,indent=4)

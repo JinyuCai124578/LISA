@@ -13,10 +13,9 @@ from model.llava import conversation as conversation_lib
 from model.llava.mm_utils import tokenizer_image_token
 from model.segment_anything.utils.transforms import ResizeLongestSide
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                         DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX)
+                         DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX, EXPLANATORY_QUESTION_LIST)
+import random
 
-os.environ['TRANSFORMERS_CACHE'] = '/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/cache'
-os.environ['HF_HOME'] = '/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/cache'
 def parse_args(args):
     parser = argparse.ArgumentParser(description="LISA chat")
     parser.add_argument("--version", default="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/cache/models--xinlai--LISA-13B-llama2-v1/snapshots/b89000be11ad0a45512745a15063f2f6af1d9a5c")
@@ -175,7 +174,7 @@ def main(args):
             torch.cuda.empty_cache()
             print("bye")
             break
-        prompt = DEFAULT_IMAGE_TOKEN + "\n" + prompt
+        prompt = DEFAULT_IMAGE_TOKEN + "\n" + prompt + random.choice(EXPLANATORY_QUESTION_LIST)
         if args.use_mm_start_end:
             replace_token = (
                 DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN

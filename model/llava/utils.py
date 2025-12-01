@@ -6,7 +6,7 @@ import sys
 
 import requests
 from llava.constants import LOGDIR
-
+import torch.distributed as dist
 server_error_msg = (
     "**NETWORK ERROR DUE TO HIGH TRAFFIC. PLEASE REGENERATE OR REFRESH THIS PAGE.**"
 )
@@ -132,3 +132,18 @@ def pretty_print_semaphore(semaphore):
     if semaphore is None:
         return "None"
     return f"Semaphore(value={semaphore._value}, locked={semaphore.locked()})"
+
+
+def rank0_print(*args):
+    if dist.is_initialized():
+        if dist.get_rank() == 0:
+            print(f"Rank {dist.get_rank()}: ", *args)
+    else:
+        print(*args)
+
+
+def rank_print(*args):
+    if dist.is_initialized():
+        print(f"Rank {dist.get_rank()}: ", *args)
+    else:
+        print(*args)

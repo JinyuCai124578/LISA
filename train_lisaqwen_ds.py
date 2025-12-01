@@ -8,6 +8,7 @@ from functools import partial
 import deepspeed
 import numpy as np
 import torch
+import torch.nn as nn
 import tqdm
 import transformers
 from peft import LoraConfig, get_peft_model
@@ -16,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 from model.LISA import LISAForCausalLM
 from model.LISA_qwen import LISAQwenForCausalLM
 from model.llava import conversation as conversation_lib
-from utils.dataset import HybridDataset, ValDataset, collate_fn, collate_fn_qwen, ValDataset_EM
+from utils.dataset import HybridDataset, ValDataset, collate_fn , ValDataset_EM
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          AverageMeter, ProgressMeter, Summary, dict_to_cuda,
                          intersectionAndUnionGPU)
@@ -36,7 +37,7 @@ def parse_args(args):
     parser = argparse.ArgumentParser(description="LISA Model Training")
     parser.add_argument("--local_rank", default=0, type=int, help="node rank")
     parser.add_argument(
-        "--version", default="liuhaotian/llava-llama-2-13b-chat-lightning-preview"
+        "--version", default="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/models--lmms-lab--llava-onevision-qwen2-7b-ov-chat/snapshots/3e979daa252a57fe1fdc4b0f537bf03d9d062031"
     )
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument(
@@ -50,7 +51,7 @@ def parse_args(args):
     parser.add_argument("--model_max_length", default=512, type=int)
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument(
-        "--vision-tower", default="openai/clip-vit-large-patch14", type=str
+        "--vision-tower", default="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/models--google--siglip-so400m-patch14-384/snapshots/9fdffc58afc957d1a03a25b10dba0329ab15c2a3", type=str
     )
     parser.add_argument("--load_in_8bit", action="store_true", default=False)
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
@@ -80,7 +81,7 @@ def parse_args(args):
     )
     parser.add_argument(
         "--grad_accumulation_steps",
-        default=10,
+        default=1, # 10
         type=int,
     )
     parser.add_argument("--val_batch_size", default=1, type=int)
@@ -110,9 +111,9 @@ def parse_args(args):
     parser.add_argument("--auto_resume", action="store_true", default=True)
     parser.add_argument(
         "--conv_type",
-        default="llava_v1",
+        default="qwen_2",
         type=str,
-        choices=["llava_v1", "llava_llama_2"],
+        choices=["llava_v1", "llava_llama_2", 'qwen_2'],
     )
     parser.add_argument("--use_gpt_qa", action="store_true", default=False)
     parser.add_argument("--train_from_scratch", action="store_true", default=False)
@@ -173,18 +174,11 @@ def main(args):
         torch_dtype = torch.bfloat16
     elif args.precision == "fp16":
         torch_dtype = torch.half
-    if args.vlm_model=='llava':
-        model = LISAForCausalLM.from_pretrained(
-            args.version,
-            # cache_dir="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/lisa",
-            torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
-        )
-    elif args.vlm_model=='qwen':
-        model = LISAQwenForCausalLM.from_pretrained(
-            args.version,
-            # cache_dir="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/qwen",
-            torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
-        )
+    model = LISAQwenForCausalLM.from_pretrained(
+        args.version,
+        # cache_dir="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/qwen",
+        torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
+    )
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -192,16 +186,16 @@ def main(args):
     model.enable_input_require_grads()
     model.gradient_checkpointing_enable()
 
-    # model.get_model().initialize_vision_modules(model.get_model().config)
-    # vision_tower = model.get_model().get_vision_tower()
-    # vision_tower.to(dtype=torch_dtype, device=args.local_rank)
+    model.get_model().initialize_vision_modules(model.get_model().config)
+    vision_tower = model.get_model().get_vision_tower()
+    vision_tower.to(dtype=torch_dtype, device=args.local_rank)
     if not args.eval_only:
-        model.lisa_model.initialize_lisa_modules(model.config)
+        model.get_model().initialize_lisa_modules(model.get_model().config)
 
-    # for p in vision_tower.parameters():
-    #     p.requires_grad = False
-    # for p in model.get_model().mm_projector.parameters():
-    #     p.requires_grad = False
+    for p in vision_tower.parameters():
+        p.requires_grad = False
+    for p in model.get_model().mm_projector.parameters():
+        p.requires_grad = False
 
     conversation_lib.default_conversation = conversation_lib.conv_templates[
         args.conv_type
@@ -366,12 +360,16 @@ def main(args):
             "allgather_bucket_size": 5e8,
         },
     }
+
+    # 将 meta tensor 移到设备并初始化（例如全零）
+    model = model.to_empty(device='cuda')  # 移动到 GPU 并分配未初始化的内存
+    model.apply(lambda m: nn.init.zeros_(m) if isinstance(m, nn.Parameter) else None)  # 初始化参数
     model_engine, _ , train_loader, scheduler = deepspeed.initialize(
         model=model,
         model_parameters=model.parameters(),
         training_data=train_dataset,
         collate_fn=partial(
-            collate_fn_qwen,
+            collate_fn,
             tokenizer=tokenizer,
             conv_type=args.conv_type,
             use_mm_start_end=args.use_mm_start_end,
@@ -413,7 +411,7 @@ def main(args):
             pin_memory=False,
             sampler=val_sampler,
             collate_fn=partial(
-                collate_fn_qwen,
+                collate_fn,
                 tokenizer=tokenizer,
                 conv_type=args.conv_type,
                 use_mm_start_end=args.use_mm_start_end,

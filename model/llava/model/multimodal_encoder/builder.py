@@ -1,4 +1,5 @@
 from .clip_encoder import CLIPVisionTower
+from .siglip_encoder import SigLipVisionTower
 
 
 def build_vision_tower(vision_tower_cfg, **kwargs):
@@ -13,5 +14,7 @@ def build_vision_tower(vision_tower_cfg, **kwargs):
         or "clip" in vision_tower
     ):
         return CLIPVisionTower(vision_tower, args=vision_tower_cfg, **kwargs)
+    elif "siglip" in vision_tower:
+        return SigLipVisionTower(vision_tower, vision_tower_cfg=vision_tower_cfg, **kwargs)
 
     raise ValueError(f"Unknown vision tower: {vision_tower}")

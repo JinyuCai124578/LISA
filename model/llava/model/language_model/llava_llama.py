@@ -88,17 +88,17 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM): # 多模态
 
         (
             input_ids,
-            attention_mask,
-            past_key_values,
-            inputs_embeds,
-            labels,
+            attention_mask, # [3, 430]
+            past_key_values, # None
+            inputs_embeds, # [3, 430, 5120]
+            labels, # [3, 430]
         ) = self.prepare_inputs_labels_for_multimodal(
             input_ids, attention_mask, past_key_values, labels, images
         )
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
 
-        outputs = self.model( # 调用LlamaForCausalLM的forward进行普通LLM的前向传播
-            input_ids=input_ids,
+        outputs = self.model( # 调用LlavaLlamaModel的forward进行普通LLM的前向传播
+            input_ids=input_ids, # None
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
@@ -108,8 +108,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM): # 多模态
             return_dict=return_dict,
         )
 
-        hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
+        hidden_states = outputs[0] # [3, 430, 5120]
+        logits = self.lm_head(hidden_states) # torch.Size([3, 430, 32003])
 
         loss = None
         if labels is not None:
@@ -122,6 +122,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM): # 多模态
             shift_labels = shift_labels.view(-1)
             # Enable model/pipeline parallelism
             shift_labels = shift_labels.to(shift_logits.device)
+            import pdb; pdb.set_trace()
             loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:

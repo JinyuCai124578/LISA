@@ -11,6 +11,7 @@ class SeparatorStyle(Enum):
     MPT = auto()
     PLAIN = auto()
     LLAMA_2 = auto()
+    CHATML = auto()
 
 
 @dataclasses.dataclass
@@ -101,6 +102,17 @@ class Conversation:
                     ret += message + seps[i % 2]
                 else:
                     ret += ""
+        elif self.sep_style == SeparatorStyle.CHATML:
+            ret = "" if self.system == "" else self.system + self.sep + "\n"
+            for role, message in messages:
+                if message:
+                    if type(message) is tuple:
+                        message, images, _ = message
+                        message = "<image>" * len(images) + message
+                    ret += role + "\n" + message + self.sep + "\n"
+                else:
+                    ret += role + "\n"
+            return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
 
@@ -376,6 +388,29 @@ conv_llava_v1_mmtag = Conversation(
     sep2="</s>",
     version="v1_mmtag",
 )
+conv_qwen = Conversation(
+    system="""<|im_start|>system
+You are a helpful assistant.""",
+    roles=("<|im_start|>user", "<|im_start|>assistant"),
+    version="qwen",
+    messages=[],
+    offset=0,
+    sep_style=SeparatorStyle.CHATML, # warning
+    sep="<|im_end|>",
+    sep2="<|im_end|> ",
+)
+
+conv_qwen_2_5 = Conversation(
+    system="""<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.""",
+    roles=("<|im_start|>user", "<|im_start|>assistant"),
+    version="qwen",
+    messages=[],
+    offset=0,
+    sep_style=SeparatorStyle.CHATML,
+    sep="<|im_end|>",
+)
+
 
 default_conversation = conv_vicuna_v0
 conv_templates = {
@@ -392,6 +427,9 @@ conv_templates = {
     "v1_mmtag": conv_llava_v1_mmtag,
     "llava_llama_2": conv_llava_llama_2,
     "mpt": conv_mpt,
+    "qwen_1_5": conv_qwen,
+    "qwen_2": conv_qwen,
+    "qwen_2_5": conv_qwen_2_5,
 }
 
 

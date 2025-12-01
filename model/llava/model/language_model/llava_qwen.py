@@ -1,4 +1,4 @@
-#    Copyright 2023 Haotian Liu
+#    Copyright 2024 Hao Zhang
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -12,47 +12,56 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+#    from  https://github.com/LLaVA-VL/LLaVA-NeXT/blob/e9835311c6f515a13702eb7a7750fcd936f65ed8/llava/model/language_model/llava_qwen.py
 
-from typing import List, Optional, Tuple, Union
-
+from typing import List, Optional, Tuple, Union, Dict
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
-from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer, Qwen2Config,
-                          Qwen2ForCausalLM, Qwen2Model)
+
+import transformers
+from transformers import AutoConfig, AutoModelForCausalLM, LlamaConfig, LlamaModel, LlamaForCausalLM
+
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.generation.utils import GenerateOutput
 
-from ..llava_arch import LlavaMetaForCausalLM, LlavaMetaModel
+# from ...constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+# 获取 llava 目录的绝对路径
+import sys
+import os
+llava_path = os.path.abspath('/home/bingxing2/ailab/caijinyu/LISA/model')
+# 将 llava 目录添加到 sys.path
+if llava_path not in sys.path:
+    sys.path.insert(0, llava_path)
+from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
+from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
 
-from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+# from .qwen.modeling_qwen import QWenLMHeadModel, QWenModel
+# from .qwen.configuration_qwen import QWenConfig
 
-# =================== 1. 定义 Qwen2 的配置 ===================
-class LlavaQwen2Config(Qwen2Config):
+
+class LlavaQwenConfig(Qwen2Config):
     model_type = "llava_qwen"
 
 
-class LlavaQwen2Model(LlavaMetaModel, Qwen2Model):
-    """
-    用于feature extractor的llm model
-    仅作为一个抽象的组合类，组合文本和图像在进入llm之前的特征处理过程
-    其中LlavaMetaModel用于注入额外的图像分支处理逻辑到feature extract逻辑中
-    """
-    config_class = LlavaQwen2Config
+class LlavaQwenModel(LlavaMetaModel, Qwen2Model):
+    config_class = LlavaQwenConfig
 
     def __init__(self, config: Qwen2Config):
-        super(LlavaQwen2Model, self).__init__(config)
+        super(LlavaQwenModel, self).__init__(config)
 
 
-class LlavaQwen2ForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM): # 多模态大模型的class
-    config_class = LlavaQwen2Config
+class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
+    config_class = LlavaQwenConfig
 
     def __init__(self, config):
-        super(Qwen2ForCausalLM, self).__init__(config)
+        # super(Qwen2ForCausalLM, self).__init__(config)
+        Qwen2ForCausalLM.__init__(self, config)
+        config.model_type = "llava_qwen"
+        config.rope_scaling = None
 
-        self.model = LlavaQwen2Model(config)
-
+        self.model = LlavaQwenModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -63,6 +72,7 @@ class LlavaQwen2ForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM): # 多模态
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
@@ -70,7 +80,11 @@ class LlavaQwen2ForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM): # 多模态
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         images: Optional[torch.FloatTensor] = None,
+        image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
+        modalities: Optional[List[str]] = ["image"],
+        dpo_forward: Optional[bool] = True,
+        cache_position=None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_attentions = (
             output_attentions
@@ -86,109 +100,116 @@ class LlavaQwen2ForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM): # 多模态
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
-        (
-            input_ids,
-            attention_mask,
-            past_key_values,
-            inputs_embeds,
-            labels,
-        ) = self.prepare_inputs_labels_for_multimodal(
-            input_ids, attention_mask, past_key_values, labels, images
-        )
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        if inputs_embeds is None:
+            # llava version
+            (
+             input_ids, 
+             attention_mask, 
+             past_key_values, 
+             inputs_embeds, 
+             labels
+             ) = self.prepare_inputs_labels_for_multimodal(
+                 input_ids, attention_mask, past_key_values, labels, images
+            )
+            # llava1.5 version
+            # (input_ids, 
+            #  position_ids, 
+            #  attention_mask, 
+            #  past_key_values, 
+            #  inputs_embeds, 
+            #  labels) = self.prepare_inputs_labels_for_multimodal_1_5(
+            #      input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes=image_sizes
+            #      )
+        if dpo_forward:
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
 
-        outputs = self.model( # 调用Qwen2ForCausalLM的forward进行普通LLM的前向传播
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
+            hidden_states = outputs[0]
+            logits = self.lm_head(hidden_states)
+            # refer to llava_llama.py LlavaLlamaForCausalLM forward function 
+            loss=None
+            if labels is not None:
+                # Shift so that tokens < n predict n
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous() # labels.shape: [3, 113], logits.shape: [1, 831, 151651]
+                # Flatten the tokens
+                loss_fct = CrossEntropyLoss()
+                shift_logits = shift_logits.view(-1, self.config.vocab_size)
+                shift_labels = shift_labels.view(-1)
+                # Enable model/pipeline parallelism
+                shift_labels = shift_labels.to(shift_logits.device)
+                import pdb; pdb.set_trace()
+                loss = loss_fct(shift_logits, shift_labels)
+            
+            if not return_dict:
+                output = (logits,) + outputs[1:]
+                return (loss,) + output if loss is not None else output
+            if self.training:
+                output_hidden_states = outputs.hidden_states
+            else:
+                output_hidden_states = hidden_states
+            return CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=output_hidden_states,  # outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
 
-        hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
-
-        loss = None
-        if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model/pipeline parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
-
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
-
-        if self.training:
-            output_hidden_states = outputs.hidden_states
         else:
-            output_hidden_states = hidden_states
+            return super().forward(
+                input_ids=input_ids, 
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=None, # # You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time
+                labels=labels,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
 
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=output_hidden_states,  # outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-
-    def prepare_inputs_for_generation(
+    @torch.no_grad()
+    def generate(
         self,
-        input_ids,
-        past_key_values=None,
-        attention_mask=None,
-        inputs_embeds=None,
-        images=None,
-        **kwargs
-    ):
-        if past_key_values:
-            input_ids = input_ids[:, -1:]
+        inputs: Optional[torch.Tensor] = None,
+        images: Optional[torch.Tensor] = None,
+        image_sizes: Optional[torch.Tensor] = None,
+        modalities: Optional[List[str]] = ["image"],
+        **kwargs,
+    ) -> Union[GenerateOutput, torch.LongTensor]:
+        position_ids = kwargs.pop("position_ids", None)
+        attention_mask = kwargs.pop("attention_mask", None)
+        if "inputs_embeds" in kwargs:
+            raise NotImplementedError("`inputs_embeds` is not supported")
 
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and past_key_values is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
+        if images is not None:
+            (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes)
         else:
-            model_inputs = {"input_ids": input_ids}
+            inputs_embeds = self.get_model().embed_tokens(inputs)
 
-        model_inputs.update(
-            {
-                "past_key_values": past_key_values,
-                "use_cache": kwargs.get("use_cache"),
-                "attention_mask": attention_mask,
-                "images": images,
-            }
-        )
-        return model_inputs
+        return super().generate(position_ids=position_ids, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs)
 
-if "llava" in CONFIG_MAPPING._mapping:
-    # 移除模型类型
-    del CONFIG_MAPPING._mapping["llava"]
-AutoConfig.register("llava_qwen", LlavaQwen2Config)
-AutoModelForCausalLM.register(LlavaQwen2Config, LlavaQwen2ForCausalLM)
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
+        images = kwargs.pop("images", None)
+        image_sizes = kwargs.pop("image_sizes", None)
+        inputs = super().prepare_inputs_for_generation(input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs)
+        if images is not None:
+            inputs["images"] = images
+        if image_sizes is not None:
+            inputs["image_sizes"] = image_sizes
+        return inputs
 
 
-if __name__ == "__main__":
-    qwen_model_name="Qwen/Qwen2.5-14B"
-    qwen_model=Qwen2ForCausalLM.from_pretrained(qwen_model_name)
-    tokenizer=AutoTokenizer.from_pretrained(qwen_model_name)
-
-    # Step 2: 构建 LLaVA-Qwen 模型配置
-    config = LlavaQwen2Config.from_pretrained(qwen_model_name)
-    # 如果有自定义 config 设置，可以在这里修改
-    config.mm_vision_tower = "openai/clip-vit-large-patch14"  # 示例视觉模型
-
-    # Step 3: 初始化 LLaVA-Qwen 模型
-    llava_model = LlavaQwen2ForCausalLM(config)
-
-    # Step 4: 将 Qwen 权重复制到 LLaVA 模型中
-    llava_model.model.load_state_dict(qwen_model.model.state_dict(), strict=False)
-    llava_model.lm_head.load_state_dict(qwen_model.lm_head.state_dict(), strict=False)
+AutoConfig.register("llava_qwen", LlavaQwenConfig)
+AutoModelForCausalLM.register(LlavaQwenConfig, LlavaQwenForCausalLM)
