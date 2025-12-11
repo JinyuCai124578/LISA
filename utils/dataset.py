@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from pycocotools import mask
 from transformers import CLIPImageProcessor
+from model.llava.model.multimodal_encoder.siglip_encoder import SigLipVisionTower
 
 from model.llava import conversation as conversation_lib
 from model.qwen import conversation as conversation_lib_qwen
@@ -648,8 +649,10 @@ class ValDataset_EM(torch.utils.data.Dataset):
         self.image_size = image_size
         self.tokenizer = tokenizer
         self.transform = ResizeLongestSide(image_size)
-        self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
-
+        if "clip" in vision_tower:
+            self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
+        elif "siglip" in vision_tower:
+            self.clip_image_processor = SigLipVisionTower(vision_tower).image_processor
         reason_seg_data,splits=val_dataset.split("_")[0], val_dataset.split("_")[1]
         reason_seg_data=reason_seg_data.replace("material","ceramic||defect||micronet||nanoparticle")
         reason_seg_data_ls = reason_seg_data.split("||")

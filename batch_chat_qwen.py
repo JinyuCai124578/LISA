@@ -51,9 +51,9 @@ def parse_args(args):
     parser.add_argument("--use_mm_start_end", action="store_true", default=True)
     parser.add_argument(
         "--conv_type",
-        default="llava_v1",
+        default="qwen_2",
         type=str,
-        choices=["llava_v1", "llava_llama_2"],
+        choices=["llava_v1", "llava_llama_2", 'qwen_2'],
     )
     parser.add_argument("--weight", default="", type=str, required=False)
     parser.add_argument("--chat_json", default="/home/caijinyu/LISA/chat_sample.json", type=str, required=False)
@@ -102,8 +102,15 @@ def main(args):
     if tokenizer.pad_token not in tokenizer.get_vocab():
         tokenizer.add_special_tokens({"pad_token": tokenizer.pad_token})
 
-    tokenizer.pad_token = tokenizer.unk_token
+    # 设置 pad_token_id
+    tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+    num_added_tokens = tokenizer.add_tokens("[SEG]")
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
+
+    if args.use_mm_start_end:
+        tokenizer.add_tokens(
+            [DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True
+        )
 
 
     torch_dtype = torch.float32
@@ -259,7 +266,6 @@ def main(args):
         input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
         input_ids = input_ids.unsqueeze(0).cuda()
         # if input_ids.shape[1]==1:
-        import pdb; pdb.set_trace()
         output_ids, pred_masks = model.evaluate(
             image_clip, # torch.Size([1, 3, 224, 224])
             image, # torch.Size([1, 3, 1024, 1024])

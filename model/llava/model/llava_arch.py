@@ -27,7 +27,7 @@ from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
 
 import sys
 import os
-llava_path = os.path.abspath('/home/bingxing2/ailab/caijinyu/LISA/model')
+llava_path = os.path.abspath('/home/caijinyu/LISA/model')
 # 将 llava 目录添加到 sys.path
 if llava_path not in sys.path:
     sys.path.insert(0, llava_path)
@@ -153,8 +153,7 @@ class LlavaMetaForCausalLM(ABC):
     ):
         """将图片和文本embedding进行拼接"""
         vision_tower = self.get_vision_tower()
-        # import pdb
-        # pdb.set_trace()
+        # import pdb; pdb.set_trace()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             """
             没有图像输入则直接返回
@@ -169,7 +168,7 @@ class LlavaMetaForCausalLM(ABC):
                     (attention_mask.shape[0], past_key_values[-1][-1].shape[-2] + 1),
                     dtype=attention_mask.dtype,
                     device=attention_mask.device,
-                )
+                ) if attention_mask is not None else None
             return input_ids, attention_mask, past_key_values, None, labels
 
         if type(images) is list or images.ndim == 5:

@@ -96,7 +96,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM): # 多模态
             input_ids, attention_mask, past_key_values, labels, images
         )
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-
+        # import pdb; pdb.set_trace()
         outputs = self.model( # 调用LlavaLlamaModel的forward进行普通LLM的前向传播
             input_ids=input_ids, # None
             attention_mask=attention_mask,
@@ -122,7 +122,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM): # 多模态
             shift_labels = shift_labels.view(-1)
             # Enable model/pipeline parallelism
             shift_labels = shift_labels.to(shift_logits.device)
-            import pdb; pdb.set_trace()
             loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:

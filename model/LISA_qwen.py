@@ -382,13 +382,17 @@ class LISAQwenForCausalLM(LlavaQwenForCausalLM):
         with torch.no_grad():
             outputs = self.generate(
                 images=images_clip,
-                input_ids=input_ids,
+                inputs=input_ids,
                 max_new_tokens=max_new_tokens,
                 num_beams=1,
                 output_hidden_states=True,
                 return_dict_in_generate=True,
+                do_sample=False,
             )
-            output_hidden_states = outputs.hidden_states[-1]
+            if outputs.hidden_states[-1].shape[1] ==1:
+                output_hidden_states=torch.cat(outputs.hidden_states, dim=1)
+            else:
+                output_hidden_states = outputs.hidden_states[-1]
             output_ids = outputs.sequences
 
             seg_token_mask = output_ids[:, 1:] == self.seg_token_idx
@@ -407,6 +411,11 @@ class LISAQwenForCausalLM(LlavaQwenForCausalLM):
             hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states))
 
             last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+            # import pdb; pdb.set_trace()
+            seg_token_mask = torch.cat(
+                [torch.zeros((seg_token_mask.shape[0], last_hidden_state.shape[1]-seg_token_mask.shape[1])).bool().cuda(), seg_token_mask],
+                dim=1,
+            )
             pred_embeddings = last_hidden_state[seg_token_mask]
 
             seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]

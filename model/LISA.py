@@ -268,7 +268,6 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states[-1])) # [3, 409, 5120] → [3, 409, 256]
 
         last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
-        import pdb; pdb.set_trace()
         pred_embeddings = last_hidden_state[seg_token_mask] # [3, 409, 256], [3, 409]
         seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
 
@@ -403,6 +402,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states))
 
             last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+            import pdb; pdb.set_trace()
             pred_embeddings = last_hidden_state[seg_token_mask]
 
             seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]

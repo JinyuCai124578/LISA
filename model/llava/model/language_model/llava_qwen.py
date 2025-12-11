@@ -29,7 +29,7 @@ from transformers.generation.utils import GenerateOutput
 # 获取 llava 目录的绝对路径
 import sys
 import os
-llava_path = os.path.abspath('/home/bingxing2/ailab/caijinyu/LISA/model')
+llava_path = os.path.abspath('/home/caijinyu/LISA/model')
 # 将 llava 目录添加到 sys.path
 if llava_path not in sys.path:
     sys.path.insert(0, llava_path)
@@ -147,7 +147,6 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 shift_labels = shift_labels.view(-1)
                 # Enable model/pipeline parallelism
                 shift_labels = shift_labels.to(shift_logits.device)
-                import pdb; pdb.set_trace()
                 loss = loss_fct(shift_logits, shift_labels)
             
             if not return_dict:
@@ -179,36 +178,64 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 return_dict=return_dict,
             )
 
-    @torch.no_grad()
-    def generate(
-        self,
-        inputs: Optional[torch.Tensor] = None,
-        images: Optional[torch.Tensor] = None,
-        image_sizes: Optional[torch.Tensor] = None,
-        modalities: Optional[List[str]] = ["image"],
-        **kwargs,
-    ) -> Union[GenerateOutput, torch.LongTensor]:
-        position_ids = kwargs.pop("position_ids", None)
-        attention_mask = kwargs.pop("attention_mask", None)
-        if "inputs_embeds" in kwargs:
-            raise NotImplementedError("`inputs_embeds` is not supported")
+    # @torch.no_grad()
+    # def generate(
+    #     self,
+    #     inputs: Optional[torch.Tensor] = None,
+    #     images: Optional[torch.Tensor] = None,
+    #     image_sizes: Optional[torch.Tensor] = None,
+    #     modalities: Optional[List[str]] = ["image"],
+    #     **kwargs,
+    # ) -> Union[GenerateOutput, torch.LongTensor]:
+    #     position_ids = kwargs.pop("position_ids", None)
+    #     attention_mask = kwargs.pop("attention_mask", None)
+    #     if "inputs_embeds" in kwargs:
+    #         raise NotImplementedError("`inputs_embeds` is not supported")
 
-        if images is not None:
-            (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes)
+    #     if images is not None:
+    #         import pdb; pdb.set_trace()
+    #         (
+    #          inputs, 
+    #          attention_mask, 
+    #          past_key_values, 
+    #          inputs_embeds, 
+    #          labels
+    #          ) = self.prepare_inputs_labels_for_multimodal(
+    #              inputs, attention_mask, None, None, images
+    #         )
+    #         # (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes)
+    #     else:
+    #         inputs_embeds = self.get_model().embed_tokens(inputs)
+
+    #     return super().generate(position_ids=position_ids, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs)
+
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, images=None, **kwargs):
+        # images = kwargs.pop("images", None)
+        # image_sizes = kwargs.pop("image_sizes", None)
+        # inputs = super().prepare_inputs_for_generation(input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs)
+        # if images is not None:
+        #     inputs["images"] = images
+        # if image_sizes is not None:
+        #     inputs["image_sizes"] = image_sizes
+        # return inputs
+        if past_key_values:
+            input_ids = input_ids[:, -1:]
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
         else:
-            inputs_embeds = self.get_model().embed_tokens(inputs)
+            model_inputs = {"input_ids": input_ids}
 
-        return super().generate(position_ids=position_ids, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs)
-
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
-        images = kwargs.pop("images", None)
-        image_sizes = kwargs.pop("image_sizes", None)
-        inputs = super().prepare_inputs_for_generation(input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs)
-        if images is not None:
-            inputs["images"] = images
-        if image_sizes is not None:
-            inputs["image_sizes"] = image_sizes
-        return inputs
+        model_inputs.update(
+            {
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+                "images": images,
+            }
+        )
+        return model_inputs
 
 
 AutoConfig.register("llava_qwen", LlavaQwenConfig)

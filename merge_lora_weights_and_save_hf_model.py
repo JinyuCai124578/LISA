@@ -12,6 +12,7 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoTokenizer
 
 from model.LISA import LISAForCausalLM
+from model.LISA_qwen import LISAQwenForCausalLM
 from utils.utils import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN
 from tqdm import tqdm
 
@@ -71,6 +72,16 @@ def main(args):
         padding_side="right",
         use_fast=False,
     )
+    if tokenizer.unk_token is not None:
+        tokenizer.pad_token = tokenizer.unk_token
+    else:
+        tokenizer.pad_token = "[PAD]"  # 设置默认填充标记
+
+    # 确保 pad_token 在词汇表中
+    if tokenizer.pad_token not in tokenizer.get_vocab():
+        tokenizer.add_special_tokens({"pad_token": tokenizer.pad_token})
+
+    # 设置 pad_token_id
     tokenizer.pad_token = tokenizer.unk_token
     num_added_tokens = tokenizer.add_tokens("[SEG]")
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
@@ -92,9 +103,16 @@ def main(args):
         torch_dtype = torch.bfloat16
     elif args.precision == "fp16":
         torch_dtype = torch.half
-    model = LISAForCausalLM.from_pretrained(
-        args.version, torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
-    )
+    if "qwen" in args.version:
+        model = LISAQwenForCausalLM.from_pretrained(
+            args.version,
+            # cache_dir="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/qwen",
+            torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
+        )
+    else:
+        model = LISAForCausalLM.from_pretrained(
+            args.version, torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
+        )
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -161,6 +179,20 @@ def main(args):
                 # print("load {}".format(name))
                 model.state_dict()[name].copy_(param)
         del lisa_params
+    
+    # 将 meta tensor 移到设备并初始化（全零）
+    for name, param in model.named_parameters():
+        if param.device.type=='meta':
+            new_param = torch.zeros_like(param, device='cuda')
+            # to cuda
+            module_path = name.split('.')
+            target = model
+            for part in module_path[:-1]:  # 遍历到最后一层前（父模块）
+                target = getattr(target, part)
+            
+            # 设置最终参数
+            setattr(target, module_path[-1], torch.nn.Parameter(new_param))
+            print(f"Initialized meta tensor '{name}' to zeros on CUDA")
 
     # state_dict = torch.load(args.weight, map_location="cpu")
     # model.load_state_dict(state_dict, strict=True)
@@ -187,7 +219,7 @@ def main(args):
             size mismatch for base_model.model.model.embed_tokens.weight: copying a param with shape torch.Size([32004, 5120]) from checkpoint, the shape in current model is torch.Size([32003, 5120]).
             size mismatch for base_model.model.lm_head.weight: copying a param with shape torch.Size([32004, 5120]) from checkpoint, the shape in current model is torch.Size([32003, 5120]).
     """
-    model.load_state_dict(full_state_dict, strict=True)
+    model.load_state_dict(full_state_dict, strict=False)
 
     if lora_r>0:
         model = model.merge_and_unload()

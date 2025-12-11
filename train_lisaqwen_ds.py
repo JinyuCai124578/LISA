@@ -81,7 +81,7 @@ def parse_args(args):
     )
     parser.add_argument(
         "--grad_accumulation_steps",
-        default=1, # 10
+        default=10, # 10
         type=int,
     )
     parser.add_argument("--val_batch_size", default=1, type=int)
@@ -118,7 +118,6 @@ def parse_args(args):
     parser.add_argument("--use_gpt_qa", action="store_true", default=False)
     parser.add_argument("--train_from_scratch", action="store_true", default=False)
     parser.add_argument('--train_mask_decoder_only', action='store_true', default=False)
-    parser.add_argument('--vlm_model', default='llava', type=str, choices=['llava', 'qwen'])
     return parser.parse_args(args)
 
 
@@ -361,9 +360,20 @@ def main(args):
         },
     }
 
-    # 将 meta tensor 移到设备并初始化（例如全零）
-    model = model.to_empty(device='cuda')  # 移动到 GPU 并分配未初始化的内存
-    model.apply(lambda m: nn.init.zeros_(m) if isinstance(m, nn.Parameter) else None)  # 初始化参数
+    # 将 meta tensor 移到设备并初始化（全零）
+    for name, param in model.named_parameters():
+        if param.device.type=='meta':
+            new_param = torch.zeros_like(param, device='cuda')
+            # to cuda
+            module_path = name.split('.')
+            target = model
+            for part in module_path[:-1]:  # 遍历到最后一层前（父模块）
+                target = getattr(target, part)
+            
+            # 设置最终参数
+            setattr(target, module_path[-1], torch.nn.Parameter(new_param))
+            print(f"Initialized meta tensor '{name}' to zeros on CUDA")
+
     model_engine, _ , train_loader, scheduler = deepspeed.initialize(
         model=model,
         model_parameters=model.parameters(),
