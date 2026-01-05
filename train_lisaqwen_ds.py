@@ -118,6 +118,7 @@ def parse_args(args):
     parser.add_argument("--use_gpt_qa", action="store_true", default=False)
     parser.add_argument("--train_from_scratch", action="store_true", default=False)
     parser.add_argument('--train_mask_decoder_only', action='store_true', default=False)
+    parser.add_argument('--full_finetune', action='store_true', default=False)
     return parser.parse_args(args)
 
 
@@ -201,6 +202,8 @@ def main(args):
     ]
 
     lora_r = args.lora_r if not args.train_mask_decoder_only else 0
+    if args.full_finetune or args.eval_only:
+        lora_r = 0
     if lora_r > 0:
 
         def find_linear_layers(model, lora_target_modules):
@@ -247,17 +250,29 @@ def main(args):
     # make text_hidden_fcs, mask_decoder, lm_head, embed_tokens trainable
     if args.train_mask_decoder_only:
         trainable_params=["mask_decoder"]
+        for n, p in model.named_parameters():
+            if any(
+                [
+                    x in n
+                    for x in trainable_params
+                ]
+            ):
+                print("n: ", n, "p.shape: ", p.shape)
+                p.requires_grad = True
+    elif args.full_finetune:
+        for n, p in model.named_parameters():
+            p.requires_grad = True
     else:
         trainable_params=["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
-    for n, p in model.named_parameters():
-        if any(
-            [
-                x in n
-                for x in trainable_params
-            ]
-        ):
-            print("n: ", n, "p.shape: ", p.shape)
-            p.requires_grad = True
+        for n, p in model.named_parameters():
+            if any(
+                [
+                    x in n
+                    for x in trainable_params
+                ]
+            ):
+                print("n: ", n, "p.shape: ", p.shape)
+                p.requires_grad = True
     # pdb.set_trace()
     if args.train_mask_decoder_only:
         assert args.train_from_scratch == False, "train_from_scratch not supported when training mask decoder only"
