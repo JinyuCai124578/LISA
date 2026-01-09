@@ -50,30 +50,58 @@ def collate_fn(
     offset_list = [0]
     cnt = 0
     inferences = []
-    for (
-        image_path,
-        images,
-        images_clip,
-        conversations,
-        masks,
-        label,
-        resize,
-        questions,
-        sampled_classes,
-        inference,
-    ) in batch:
-        image_path_list.append(image_path)
-        images_list.append(images)
-        images_clip_list.append(images_clip)
-        conversation_list.extend(conversations)
-        label_list.append(label)
-        masks_list.append(masks.float())
-        resize_list.append(resize)
-        questions_list.append(questions)
-        sampled_classes_list.append(sampled_classes)
-        cnt += len(conversations)
-        offset_list.append(cnt)
-        inferences.append(inference)
+    if len(batch[0])==12:
+        for (
+            image_path,
+            images,
+            images_clip,
+            conversations,
+            masks,
+            label,
+            resize,
+            questions,
+            sampled_classes,
+            _, # classes
+            _, # prompts
+            inference,
+        ) in batch:
+            image_path_list.append(image_path)
+            images_list.append(images)
+            images_clip_list.append(images_clip)
+            conversation_list.extend(conversations)
+            label_list.append(label)
+            masks_list.append(masks.float())
+            resize_list.append(resize)
+            questions_list.append(questions)
+            sampled_classes_list.append(sampled_classes)
+            cnt += len(conversations)
+            offset_list.append(cnt)
+            inferences.append(inference)
+    else:
+        for (
+            image_path,
+            images,
+            images_clip,
+            conversations,
+            masks,
+            label,
+            resize,
+            questions,
+            sampled_classes,
+            inference,
+        ) in batch:
+            image_path_list.append(image_path)
+            images_list.append(images)
+            images_clip_list.append(images_clip)
+            conversation_list.extend(conversations)
+            label_list.append(label)
+            masks_list.append(masks.float())
+            resize_list.append(resize)
+            questions_list.append(questions)
+            sampled_classes_list.append(sampled_classes)
+            cnt += len(conversations)
+            offset_list.append(cnt)
+            inferences.append(inference)
 
     if use_mm_start_end:
         # replace <image> token
@@ -169,6 +197,181 @@ def collate_fn(
         "inference": inferences[0],
         "conversation_list": conversation_list,
     }
+
+def collate_fn_grpo(
+    batch, tokenizer=None, conv_type="llava_v1", use_mm_start_end=True, local_rank=-1, precision='bf16'
+):
+    image_path_list = []
+    images_list = []
+    images_clip_list = []
+    conversation_list = []
+    masks_list = []
+    label_list = []
+    resize_list = []
+    questions_list = []
+    sampled_classes_list = []
+    classes_list = []
+    prompts_list = []
+    offset_list = [0]
+    cnt = 0
+    inferences = []
+    for (
+        image_path,
+        images,
+        images_clip,
+        conversations,
+        masks,
+        label,
+        resize,
+        questions,
+        sampled_classes,
+        classes,
+        prompts,
+        inference,
+    ) in batch:
+        image_path_list.append(image_path)
+        images_list.append(images)
+        images_clip_list.append(images_clip)
+        conversation_list.extend(conversations)
+        label_list.append(label)
+        masks_list.append(masks.float())
+        resize_list.append(resize)
+        questions_list.append(questions)
+        sampled_classes_list.append(sampled_classes)
+        classes_list.append(classes)
+        prompts_list.extend(prompts)
+        cnt += len(conversations)
+        offset_list.append(cnt)
+        inferences.append(inference)
+
+    if use_mm_start_end:
+        # replace <image> token
+        for i in range(len(conversation_list)):
+            replace_token = DEFAULT_IMAGE_TOKEN
+            replace_token = (
+                DEFAULT_IM_START_TOKEN + replace_token + DEFAULT_IM_END_TOKEN
+            )
+            conversation_list[i] = conversation_list[i].replace(
+                DEFAULT_IMAGE_TOKEN, replace_token
+            )
+    input_ids = [
+        tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
+        for prompt in conversation_list
+    ]
+    prompt_ids=[
+        tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
+        for prompt in prompts_list
+    ]
+    input_ids = torch.nn.utils.rnn.pad_sequence(
+        input_ids, batch_first=True, padding_value=tokenizer.pad_token_id
+    )
+    prompt_ids = torch.nn.utils.rnn.pad_sequence(
+        prompt_ids, batch_first=True, padding_value=tokenizer.pad_token_id
+    )
+    attention_masks = input_ids.ne(tokenizer.pad_token_id)
+    attention_masks_prompts=prompt_ids.ne(tokenizer.pad_token_id)
+
+    conv = conversation_lib.default_conversation.copy()
+    targets = input_ids.clone()
+
+    if conv_type == "llava_v1":
+        sep = conv.sep + conv.roles[1] + ": "
+    elif conv_type == "qwen_2":
+        sep = conv.roles[1]
+    else:
+        sep = "[/INST] "
+    for conversation, target in zip(conversation_list, targets):
+        total_len = int(target.ne(tokenizer.pad_token_id).sum())
+
+        rounds = conversation.split(conv.sep2)
+        cur_len = 1 if conv_type == "llava_v1" else 0 # warning
+        target[:cur_len] = IGNORE_INDEX
+        for i, rou in enumerate(rounds):
+            if rou == "":
+                break
+
+            parts = rou.split(sep)
+            # if len(parts) != 2:
+            #     break
+            assert len(parts) == 2, (len(parts), rou, sep)
+            parts[0] += sep
+
+            if DEFAULT_IMAGE_TOKEN in conversation:
+                round_len = len(tokenizer_image_token(rou, tokenizer))
+                instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 2
+            else:
+                round_len = len(tokenizer(rou).input_ids)
+                instruction_len = len(tokenizer(parts[0]).input_ids) - 2
+
+            target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
+
+            cur_len += round_len
+        target[cur_len:] = IGNORE_INDEX
+
+        if False:
+            z = target.clone()
+            z = torch.where(z == IGNORE_INDEX, tokenizer.unk_token_id, z)
+            if local_rank == 0:
+                print(
+                    "conversation: ",
+                    conversation,
+                    "tokenizer.decode(z): ",
+                    tokenizer.decode(z),
+                )
+
+        if cur_len < tokenizer.model_max_length:
+            assert cur_len == total_len, (cur_len, total_len)
+
+    if inferences[0] == False:
+        truncate_len = tokenizer.model_max_length - 255
+
+        if input_ids.shape[1] > truncate_len:
+            input_ids = input_ids[:, :truncate_len]
+            targets = targets[:, :truncate_len]
+            attention_masks = attention_masks[:, :truncate_len]
+            prompt_ids = prompt_ids[:, :truncate_len]
+            attention_masks_prompts=attention_masks_prompts[:, :truncate_len]
+
+    processed_batch= {
+        "image_paths": image_path_list,
+        "images": torch.stack(images_list, dim=0),
+        "images_clip": torch.stack(images_clip_list, dim=0),
+        "input_ids": input_ids,
+        "labels": targets,
+        "attention_masks": attention_masks,
+        "masks_list": masks_list,
+        "label_list": label_list,
+        "resize_list": resize_list,
+        "offset": torch.LongTensor(offset_list),
+        "questions_list": questions_list,
+        "sampled_classes_list": sampled_classes_list,
+        "inference": inferences[0],
+        "conversation_list": conversation_list,
+        ### add classes_list for the new dataset
+        "classes_list": classes_list,
+        "prompt_ids": prompt_ids,
+        "attention_masks_prompts": attention_masks_prompts,
+    }
+
+    if precision == "fp16":
+        for key, value in processed_batch.items():
+            if isinstance(value, torch.Tensor):
+                # 对于浮点数张量转换为 fp16
+                if value.dtype == torch.float32:
+                    processed_batch[key] = value.half()
+                # 对于长整型等其他类型保持不变
+                elif value.dtype == torch.int64 or value.dtype == torch.int32:
+                    processed_batch[key] = value
+    elif precision == "bf16":
+        for key, value in processed_batch.items():
+            if isinstance(value, torch.Tensor):
+                # 对于浮点数张量转换为 bf16
+                if value.dtype == torch.float32:
+                    processed_batch[key] = value.bfloat16()
+                elif value.dtype == torch.int64 or value.dtype == torch.int32:
+                    processed_batch[key] = value
+    
+    return processed_batch
 
 '''
 def collate_fn_qwen(
@@ -746,6 +949,7 @@ class ValDataset_EM(torch.utils.data.Dataset):
 
         questions = []
         answers = []
+        classes=[]
         for i, text in enumerate(sampled_sents):
             if is_sentence:
                 question_template = random.choice(self.long_question_list)
@@ -755,6 +959,7 @@ class ValDataset_EM(torch.utils.data.Dataset):
                     """
                     # pdb.set_trace()
                     class_name=self.json_data_list[idx]["shapes"][i]["class_name"]
+                    classes.append(class_name)
                     # qa_list=self.json_data_list[idx]["gpt_qa"]
                     # qa_list_class=[qa for qa in qa_list if qa["class_name"].lower() == class_name.lower()]
                     qa_list_class=[]
@@ -776,6 +981,7 @@ class ValDataset_EM(torch.utils.data.Dataset):
                         answers.append(answer)
                         # print(text,answer)
                         conversations = []
+                        prompts=[]
                         conv = conversation_lib.default_conversation.copy()
                         roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
 
@@ -783,6 +989,9 @@ class ValDataset_EM(torch.utils.data.Dataset):
                         while i < len(questions):
                             conv.messages = []
                             conv.append_message(conv.roles[0], questions[i])
+                            conv.append_message(conv.roles[1], "")
+                            prompts.append(conv.get_prompt())
+                            conv.messages.pop()
                             conv.append_message(conv.roles[1], answers[i])
                             conversations.append(conv.get_prompt())
                             i += 1
@@ -819,6 +1028,7 @@ class ValDataset_EM(torch.utils.data.Dataset):
                 answers.append(random.choice(self.answer_list))
 
             conversations = []
+            prompts=[]
             conv = conversation_lib.default_conversation.copy()
             roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
 
@@ -826,6 +1036,9 @@ class ValDataset_EM(torch.utils.data.Dataset):
             while i < len(questions):
                 conv.messages = []
                 conv.append_message(conv.roles[0], questions[i])
+                conv.append_message(conv.roles[1], "")
+                prompts.append(conv.get_prompt())
+                conv.messages.pop()
                 conv.append_message(conv.roles[1], answers[i])
                 conversations.append(conv.get_prompt())
                 i += 1
@@ -850,6 +1063,7 @@ class ValDataset_EM(torch.utils.data.Dataset):
             masks.shape,
             len(sampled_sents),
         )
+        assert len(conversations)==len(prompts), (len(conversations), len(prompts))
         inference = True
         return (
             image_path,
@@ -861,5 +1075,7 @@ class ValDataset_EM(torch.utils.data.Dataset):
             resize,
             None,
             None,
+            classes,
+            prompts, # prompts 要补
             inference,
         )

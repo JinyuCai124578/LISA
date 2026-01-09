@@ -30,7 +30,7 @@ class ReasonSegDataset_EM(torch.utils.data.Dataset):
 
     def __init__(
         self,
-        base_data_dir="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation",
+        base_data_dir="/mnt/shared-storage-user/ai4sdata2-share/caijinyu/data",
         tokenizer=None,
         vision_tower=None,
         samples_per_epoch=500 * 8 * 2 * 10,
@@ -153,6 +153,8 @@ class ReasonSegDataset_EM(torch.utils.data.Dataset):
 
         questions = []
         answers = []
+        classes=[]
+        
         for i, text in enumerate(sampled_sents):
             if is_sentence:
                 question_template = random.choice(self.long_question_list)
@@ -162,6 +164,7 @@ class ReasonSegDataset_EM(torch.utils.data.Dataset):
                     """
                     # pdb.set_trace()
                     class_name=self.json_data_list[idx]["shapes"][i]["class_name"]
+                    classes.append(class_name)
                     # qa_list=self.json_data_list[idx]["gpt_qa"]
                     # qa_list_class=[qa for qa in qa_list if qa["class_name"].lower() == class_name.lower()]
                     qa_list_class=[]
@@ -183,6 +186,7 @@ class ReasonSegDataset_EM(torch.utils.data.Dataset):
                         answers.append(answer)
                         # print(text,answer)
                         conversations = []
+                        prompts=[]
                         conv = conversation_lib.default_conversation.copy()
                         roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
 
@@ -190,6 +194,9 @@ class ReasonSegDataset_EM(torch.utils.data.Dataset):
                         while i < len(questions):
                             conv.messages = []
                             conv.append_message(conv.roles[0], questions[i])
+                            conv.append_message(conv.roles[1], "")
+                            prompts.append(conv.get_prompt())
+                            conv.messages.pop()
                             conv.append_message(conv.roles[1], answers[i])
                             conversations.append(conv.get_prompt())
                             i += 1
@@ -226,6 +233,7 @@ class ReasonSegDataset_EM(torch.utils.data.Dataset):
                 answers.append(random.choice(self.answer_list))
 
             conversations = []
+            prompts=[]
             conv = conversation_lib.default_conversation.copy()
             roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
 
@@ -233,6 +241,9 @@ class ReasonSegDataset_EM(torch.utils.data.Dataset):
             while i < len(questions):
                 conv.messages = []
                 conv.append_message(conv.roles[0], questions[i])
+                conv.append_message(conv.roles[1], "")
+                prompts.append(conv.get_prompt())
+                conv.messages.pop()
                 conv.append_message(conv.roles[1], answers[i])
                 conversations.append(conv.get_prompt())
                 i += 1
@@ -257,6 +268,7 @@ class ReasonSegDataset_EM(torch.utils.data.Dataset):
             masks.shape,
             len(sampled_sents),
         )
+        assert len(conversations)==len(prompts), (len(conversations), len(prompts))
         return (
             image_path,
             image,
@@ -267,6 +279,8 @@ class ReasonSegDataset_EM(torch.utils.data.Dataset):
             resize,
             questions,
             sampled_sents,
+            classes,
+            prompts
         )
 
 if __name__ == "__main__":

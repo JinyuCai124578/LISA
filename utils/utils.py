@@ -101,7 +101,8 @@ class AverageMeter(object):
                 [self.sum, self.count], dtype=torch.float32, device=device
             )
 
-        dist.all_reduce(total, dist.ReduceOp.SUM, async_op=False)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(total, dist.ReduceOp.SUM, async_op=False)
         if total.shape[0] > 2:
             self.sum, self.count = total[:-1].cpu().numpy(), total[-1].cpu().item()
         else:

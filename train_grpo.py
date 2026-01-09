@@ -1,3 +1,4 @@
+# 应该不需要initialize lisa model了
 import argparse
 import os
 import shutil
@@ -16,13 +17,18 @@ from torch.utils.tensorboard import SummaryWriter
 from model.LISA import LISAForCausalLM
 # from model.LISA_qwen import LISAQwenForCausalLM
 from model.llava import conversation as conversation_lib
-from utils.dataset import HybridDataset, ValDataset, collate_fn, ValDataset_EM
+from utils.dataset import HybridDataset, ValDataset, collate_fn_grpo, ValDataset_EM
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, IMAGE_TOKEN_INDEX, 
                          AverageMeter, ProgressMeter, Summary, dict_to_cuda,
                          intersectionAndUnionGPU, evaluate_text_metrics)
 import pdb
 import traceback
 import torch.nn as nn
+
+from model.grpo.data_parallel import train_with_grpo
+from model.grpo.utils import optimize_model_memory
+from model.grpo.reward import combined_reward
+from torch.utils.data import DataLoader
 
 def info(type, value, tb):
     traceback.print_exception(type, value, tb)
@@ -121,17 +127,7 @@ def parse_args(args):
     parser.add_argument('--full_finetune', action='store_true', default=False)
     parser.add_argument('--full_from_scratch', action='store_true', default=False)
     parser.add_argument('--score_text', action='store_true', default=False)
-    parser.add_argument('--lora_module_full_finetune', action='store_true', default=False)
-
-    parser.add_argument("--grpo", action="store_true", default=False)
-    parser.add_argument("--epochs_grpo", default=20, type=int)
-    parser.add_argument(
-        "--batch_size_grpo", default=1, type=int, help="batch size per device per step"
-    )
-    parser.add_argument("--num_generations", default=3, type=int)
-    parser.add_argument("--steps_per_epoch_grpo", default=125, type=int)
-    parser.add_argument("--lr_grpo", default=0.00001, type=float)
-
+    parser.add_argument("--num_generations", default=4, type=int)
     return parser.parse_args(args)
 
 
@@ -180,7 +176,8 @@ def main(args):
     model = LISAForCausalLM.from_pretrained(
         args.version,
         # cache_dir="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/lisa",
-        torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
+        torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args,
+        device_map='cuda:0',
     )
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
@@ -192,8 +189,8 @@ def main(args):
     model.get_model().initialize_vision_modules(model.get_model().config)
     vision_tower = model.get_model().get_vision_tower()
     vision_tower.to(dtype=torch_dtype, device=args.local_rank)
-    if not args.eval_only:
-        model.get_model().initialize_lisa_modules(model.get_model().config)
+    # if not args.eval_only:
+    #     model.get_model().initialize_lisa_modules(model.get_model().config)
 
     for p in vision_tower.parameters():
         p.requires_grad = False
@@ -204,52 +201,7 @@ def main(args):
         args.conv_type
     ]
 
-    lora_r = args.lora_r if not args.train_mask_decoder_only else 0
-    if args.full_finetune or args.full_from_scratch or args.eval_only or args.lora_module_full_finetune:
-        lora_r = 0
-    if lora_r > 0:
-
-        def find_linear_layers(model, lora_target_modules):
-            cls = torch.nn.Linear
-            lora_module_names = set()
-            for name, module in model.named_modules():
-                if (
-                    isinstance(module, cls) # 只看线性层
-                    and all(
-                        [
-                            x not in name
-                            for x in [
-                                "visual_model",
-                                "vision_tower",
-                                "mm_projector",
-                                "text_hidden_fcs",
-                            ] # 不希望用lora的模块
-                        ]
-                    )
-                    and any([x in name for x in lora_target_modules]) # 只对lora_target_modules的线性层应用LoRA
-                ):
-                    lora_module_names.add(name)
-            return sorted(list(lora_module_names))
-
-        lora_alpha = args.lora_alpha
-        lora_dropout = args.lora_dropout
-        lora_target_modules = find_linear_layers(
-            model, args.lora_target_modules.split(",")
-        )
-        # print("lora module",lora_target_modules)
-        lora_config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=lora_target_modules,
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM", # 因果语言模型；通常用于生成式语言模型
-        )
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
-
-    model.resize_token_embeddings(len(tokenizer))
-
+    
     # make text_hidden_fcs, mask_decoder, lm_head, embed_tokens trainable
     if args.train_mask_decoder_only:
         trainable_params=["mask_decoder"]
@@ -264,44 +216,6 @@ def main(args):
                 p.requires_grad = True
             else:
                 p.requires_grad = False
-    elif args.lora_module_full_finetune:
-        # 找出所有需要full finetune的 之前用lora训练的模块
-        full_finetune_module_names = set()
-        cls = torch.nn.Linear
-        for name, module in model.named_modules():
-            if (
-                isinstance(module, cls)
-                and all(
-                    [
-                        x not in name
-                        for x in [
-                            "visual_model",
-                            "vision_tower",
-                            "mm_projector",
-                            "text_hidden_fcs",
-                        ]
-                    ]
-                )
-                and any([x in name for x in args.lora_target_modules.split(",")])
-            ):
-                full_finetune_module_names.add(name)
-    
-        for n, p in model.named_parameters():
-            is_target = any([module_name in n for module_name in full_finetune_module_names])
-            if is_target:
-                # print("Full finetuning module - n: ", n, "p.shape: ", p.shape)
-                p.requires_grad = True
-        # 之前的训练模块
-        trainable_params=["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
-        for n, p in model.named_parameters():
-            if any(
-                [
-                    x in n
-                    for x in trainable_params
-                ]
-            ):
-                # print("n: ", n, "p.shape: ", p.shape)
-                p.requires_grad = True
     elif args.full_finetune:
         for n, p in model.named_parameters():
             p.requires_grad = True
@@ -396,91 +310,42 @@ def main(args):
         val_dataset = None
         print(f"Training with {len(train_dataset)} examples.")
 
-    ds_config = {
-        "train_micro_batch_size_per_gpu": args.batch_size,
-        "gradient_accumulation_steps": args.grad_accumulation_steps,
-        "optimizer": {
-            "type": "AdamW",
-            "params": {
-                "lr": args.lr,
-                "weight_decay": 0.0,
-                "betas": (args.beta1, args.beta2),
-            },
-        },
-        "scheduler": {
-            "type": "WarmupDecayLR",
-            "params": {
-                "total_num_steps": args.epochs * args.steps_per_epoch,
-                "warmup_min_lr": 0,
-                "warmup_max_lr": args.lr,
-                "warmup_num_steps": 100,
-                "warmup_type": "linear",
-            },
-        },
-        "fp16": {
-            "enabled": args.precision == "fp16",
-        },
-        "bf16": {
-            "enabled": args.precision == "bf16",
-        },
-        "gradient_clipping": 1.0,
-        "zero_optimization": {
-            "stage": 2,
-            "contiguous_gradients": True,
-            "overlap_comm": True,
-            "reduce_scatter": True,
-            "reduce_bucket_size": 5e8,
-            "allgather_bucket_size": 5e8,
-        },
-    }
-    model_engine, _ , train_loader, scheduler = deepspeed.initialize(
-        model=model,
-        model_parameters=model.parameters(),
-        training_data=train_dataset,
+    model=optimize_model_memory(model)
+    
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
         collate_fn=partial(
-            collate_fn,
+            collate_fn_grpo,
             tokenizer=tokenizer,
             conv_type=args.conv_type,
             use_mm_start_end=args.use_mm_start_end,
             local_rank=args.local_rank,
+            precision=args.precision,
         ),
-        config=ds_config,
+        num_workers=args.workers,  # 可选：增加数据加载速度
+        pin_memory=True  # 可选：加快 GPU 数据传输
     )
 
-    # resume deepspeed checkpoint
-    if args.auto_resume and len(args.resume) == 0:
-        resume = os.path.join(args.log_dir, "ckpt_model")
-        if os.path.exists(resume):
-            args.resume = resume
-
-    if args.resume:
-        load_path, client_state = model_engine.load_checkpoint(args.resume)
-        with open(os.path.join(args.resume, "latest"), "r") as f:
-            ckpt_dir = f.readlines()[0].strip()
-        args.start_epoch = (
-            int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
-        )
-        print(
-            "resume training from {}, start from epoch {}".format(
-                args.resume, args.start_epoch
-            )
-        )
+    # resume deepspeed checkpoint (deleted)
+    
 
     # validation dataset
     if val_dataset is not None:
         assert args.val_batch_size == 1
-        val_sampler = torch.utils.data.distributed.DistributedSampler(
-            val_dataset, shuffle=False, drop_last=False
-        )
+        # val_sampler = torch.utils.data.distributed.DistributedSampler(
+        #     val_dataset, shuffle=False, drop_last=False
+        # )
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
             batch_size=args.val_batch_size,
             shuffle=False,
             num_workers=args.workers,
             pin_memory=False,
-            sampler=val_sampler,
+            # sampler=val_sampler,
             collate_fn=partial(
-                collate_fn,
+                collate_fn_grpo,
                 tokenizer=tokenizer,
                 conv_type=args.conv_type,
                 use_mm_start_end=args.use_mm_start_end,
@@ -488,274 +353,47 @@ def main(args):
             ),
         )
 
-    train_iter = iter(train_loader)
-    best_score, cur_ciou = 0.0, 0.0
-
-    if args.eval_only:
-        if args.score_text:
-            # import pdb; pdb.set_trace()
-            giou, ciou, text_metrics = validate_text(val_loader, model_engine, 0, writer, tokenizer, args)
-            print(giou,ciou,text_metrics)
-        else:
-            giou, ciou = validate(val_loader, model_engine, 0, writer, args)
-            text_metrics={}
-        exit()
-
-    for epoch in range(args.start_epoch, args.epochs):
-        # train for one epoch
-        train_iter = train(
-            train_loader,
-            model_engine,
-            epoch,
-            scheduler,
-            writer,
-            train_iter,
-            args,
-        )
-        # pdb.set_trace()
-
-        if args.no_eval == False:
-            if args.score_text:
-                giou, ciou, text_metrics = validate_text(val_loader, model_engine, epoch, writer, tokenizer, args)
-            else:
-                giou, ciou = validate(val_loader, model_engine, epoch, writer, args)
-                text_metrics={}
-            is_best = giou > best_score
-            best_score = max(giou, best_score)
-            cur_ciou = ciou if is_best else cur_ciou
-
-        if args.no_eval or is_best:
-            save_dir = os.path.join(args.log_dir, "ckpt_model")
-            if args.local_rank == 0:
-                torch.save(
-                    text_metrics.update({"epoch": epoch}),
-                    os.path.join(
-                        args.log_dir,
-                        "meta_log_giou{:.3f}_ciou{:.3f}.pth".format(
-                            best_score, cur_ciou
-                        ),
-                    ),
-                )
-                if os.path.exists(save_dir):
-                    shutil.rmtree(save_dir)
-            torch.distributed.barrier()
-            model_engine.save_checkpoint(save_dir)
-    
-
-    if args.grpo:
-        import copy
-        from model.grpo.data_parallel_ds import train_with_grpo_epoch
-        from model.grpo.reward import combined_reward
-        def clean_copy(model_engine):
-            # 获取模型本体（兼容 DDP/FSDP）
-            model = model_engine.module if hasattr(model_engine, "module") else model_engine
-
-            # 1. 创建同结构的新模型
-            model_class = model.__class__
-            new_model = model_class.__new__(model_class)
-
-            # 2. 构造新模型（init）
-            new_model.__dict__.update({k: v for k, v in model.__dict__.items() if k not in ['_forward_hooks', '_backward_hooks']})
-            new_model.__init__(*getattr(model, "_init_args", ()), **getattr(model, "_init_kwargs", {}))
-
-            # 3. 复制参数（避免 deepcopy）
-            new_model.load_state_dict(model.state_dict(), strict=True)
-
-            return new_model.cpu().eval()
-
-        print("\nStarting RL fine-tuning using GRPO...")
-        num_gpus = torch.cuda.device_count()
-        # This config was tested on a 8xA100 node, where each A100 is has 80GB of VRAM
-        training_config = {
-            'num_iterations': args.epochs_grpo,
-            'num_steps': args.steps_per_epoch_grpo,
-            'batch_size': args.batch_size_grpo, # reduce if you have fewer GPUs
-            'num_generations': args.num_generations, # reduce if you have GPUs with less VRAM
-            'max_completion_length': args.model_max_length, # reduce if you have GPUs with less VRAM
-            'beta': 0.04,
-            'learning_rate': args.lr_grpo,
-            'mu': 1,
-            'epsilon': 0.1
-        }
-        dtype = next(model_engine.module.parameters()).dtype
-        ref_base_model = clean_copy(model_engine)
-        for p in ref_base_model.parameters():
-            p.requires_grad = False
-
-        ref_infer_engine = deepspeed.init_inference(
-            model=ref_base_model,
-            mp_size=1,
-            dtype=dtype,
-            replace_with_kernel_inject=False     # ← 禁止 kernel 注入
-        )
-        policy_base_model = clean_copy(model_engine)
-        for p in policy_base_model.parameters():
-            p.requires_grad = False
-
-        policy_infer_engine = deepspeed.init_inference(
-            model=policy_base_model,
-            mp_size=1,
-            dtype=dtype,
-            replace_with_kernel_inject=False     # ← 禁止 kernel 注入
-        )
-        for epoch in range(0, args.epochs_grpo):
-            print("Epoch: ", epoch)
-            model_engine = train_with_grpo_epoch(
-                ref_infer_engine=ref_infer_engine,
-                policy_infer_engine=policy_infer_engine,
-                policy_base_model=policy_base_model,
-                model_engine=model_engine,
-                tokenizer=tokenizer,
-                train_dataloader=train_loader,
-                train_iter=train_iter,
-                reward_function=combined_reward,
-                device_ids=list(range(num_gpus)) if num_gpus > 1 else None,
-                **training_config
-            )
-            if args.no_eval == False:
-                giou, ciou = validate(val_loader, model, 0, writer, args)
-                is_best = giou > best_score
-                best_score = max(giou, best_score)
-                cur_ciou = ciou if is_best else cur_ciou
-                    
-            if args.no_eval or is_best:
-                save_dir = os.path.join(args.log_dir, "ckpt_model_grpo")
-                if args.local_rank == 0:
-                    torch.save({},
-                        os.path.join(
-                            args.log_dir,
-                                "meta_log_grpo_epoch{}_giou{:.3f}_ciou{:.3f}.pth".format(
-                                epoch, best_score, cur_ciou
-                            ),
-                        ))
-                    if os.path.exists(save_dir):
-                        shutil.rmtree(save_dir)
-                torch.distributed.barrier()
-                model_engine.save_checkpoint(save_dir)
 
 
-def train(
-    train_loader,
-    model,
-    epoch,
-    scheduler,
-    writer,
-    train_iter,
-    args,
-):
-    """Main training loop."""
-    batch_time = AverageMeter("Time", ":6.3f")
-    data_time = AverageMeter("Data", ":6.3f")
-    losses = AverageMeter("Loss", ":.4f")
-    ce_losses = AverageMeter("CeLoss", ":.4f")
-    mask_bce_losses = AverageMeter("MaskBCELoss", ":.4f")
-    mask_dice_losses = AverageMeter("MaskDICELoss", ":.4f")
-    mask_losses = AverageMeter("MaskLoss", ":.4f")
+    # if args.score_text:
+    #     # import pdb; pdb.set_trace()
+    #     giou, ciou, text_metrics = validate_text(val_loader, model, 0, writer, tokenizer, args)
+    #     # print(giou,ciou,text_metrics)
+    # else:
+    #     giou, ciou = validate(val_loader, model, 0, writer, args)
+    #     text_metrics={}
+    # print("pre grpo:", giou, ciou, text_metrics)
 
-    progress = ProgressMeter(
-        args.steps_per_epoch,
-        [
-            batch_time,
-            losses,
-            ce_losses,
-            mask_losses,
-            mask_bce_losses,
-            mask_dice_losses,
-        ],
-        prefix="Epoch: [{}]".format(epoch),
+    print("\nStarting RL fine-tuning using GRPO...")
+    # This config was tested on a 8xA100 node, where each A100 is has 80GB of VRAM
+    training_config = {
+        'num_iterations': args.epochs,
+        'num_steps': args.steps_per_epoch,
+        'batch_size': args.batch_size, # reduce if you have fewer GPUs
+        'num_generations': args.num_generations, # reduce if you have GPUs with less VRAM
+        'max_completion_length': args.model_max_length, # reduce if you have GPUs with less VRAM
+        'beta': 0.04,
+        'learning_rate': args.lr,
+        'mu': 1,
+        'epsilon': 0.1
+    }
+    num_gpus = torch.cuda.device_count()
+    model = train_with_grpo(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataloader=train_loader,
+        reward_function=combined_reward,
+        device_ids=list(range(num_gpus)) if num_gpus > 1 else None,
+        **training_config
     )
-
-    # switch to train mode
-    model.train()
-    end = time.time()
-    for global_step in range(args.steps_per_epoch):
-        for i in range(args.grad_accumulation_steps):
-            try:
-                input_dict = next(train_iter)
-            except:
-                train_iter = iter(train_loader)
-                input_dict = next(train_iter)
-
-            data_time.update(time.time() - end)
-            input_dict = dict_to_cuda(input_dict)
-
-            if args.precision == "fp16":
-                input_dict["images"] = input_dict["images"].half()
-                input_dict["images_clip"] = input_dict["images_clip"].half()
-            elif args.precision == "bf16":
-                input_dict["images"] = input_dict["images"].bfloat16()
-                input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
-            else:
-                input_dict["images"] = input_dict["images"].float()
-                input_dict["images_clip"] = input_dict["images_clip"].float()
-            
-            # print(input_dict["images"].shape,input_dict["input_ids"].shape)  torch.Size([8, 3, 1024, 1024]) torch.Size([20?, 191])
-            # import pdb; pdb.set_trace()
-            output_dict = model(**input_dict)
-
-            loss = output_dict["loss"]
-            ce_loss = output_dict["ce_loss"]
-            mask_bce_loss = output_dict["mask_bce_loss"]
-            mask_dice_loss = output_dict["mask_dice_loss"]
-            mask_loss = output_dict["mask_loss"]
-
-            losses.update(loss.item(), input_dict["images"].size(0))
-            ce_losses.update(ce_loss.item(), input_dict["images"].size(0))
-            mask_bce_losses.update(mask_bce_loss.item(), input_dict["images"].size(0))
-            mask_dice_losses.update(mask_dice_loss.item(), input_dict["images"].size(0))
-            mask_losses.update(mask_loss.item(), input_dict["images"].size(0))
-            model.backward(loss)
-            model.step()
-            torch.cuda.empty_cache() 
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-        if global_step % args.print_freq == 0:
-            if args.distributed:
-                batch_time.all_reduce()
-                data_time.all_reduce()
-
-                losses.all_reduce()
-                ce_losses.all_reduce()
-                mask_bce_losses.all_reduce()
-                mask_dice_losses.all_reduce()
-                mask_losses.all_reduce()
-
-            if args.local_rank == 0:
-                progress.display(global_step + 1)
-                writer.add_scalar("train/loss", losses.avg, global_step)
-                writer.add_scalar("train/ce_loss", ce_losses.avg, global_step)
-                writer.add_scalar(
-                    "train/mask_bce_loss", mask_bce_losses.avg, global_step
-                )
-                writer.add_scalar(
-                    "train/mask_dice_loss", mask_dice_losses.avg, global_step
-                )
-                writer.add_scalar("train/mask_loss", mask_losses.avg, global_step)
-                writer.add_scalar(
-                    "metrics/total_secs_per_batch", batch_time.avg, global_step
-                )
-                writer.add_scalar(
-                    "metrics/data_secs_per_batch", data_time.avg, global_step
-                )
-
-            batch_time.reset()
-            data_time.reset()
-            losses.reset()
-            ce_losses.reset()
-            mask_bce_losses.reset()
-            mask_dice_losses.reset()
-            mask_losses.reset()
-
-        if global_step != 0:
-            curr_lr = scheduler.get_last_lr()
-            if args.local_rank == 0:
-                writer.add_scalar("train/lr", curr_lr[0], global_step)
-
-    return train_iter
-
+    if args.score_text:
+        # import pdb; pdb.set_trace()
+        giou, ciou, text_metrics = validate_text(val_loader, model, 0, writer, tokenizer, args)
+        # print(giou,ciou,text_metrics)
+    else:
+        giou, ciou = validate(val_loader, model, 0, writer, args)
+        text_metrics={}
+    print("post grpo:", giou, ciou, text_metrics)
 
 def validate(val_loader, model_engine, epoch, writer, args):
     intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
