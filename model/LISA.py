@@ -510,6 +510,12 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                 return_dict_in_generate=True,
             )
             output_hidden_states = outputs.hidden_states[-1]
+            if type(outputs.hidden_states[-1]) is tuple:
+                output_hidden_states = outputs.hidden_states[-1][-1]
+            elif outputs.hidden_states[-1].shape[1] ==1:
+                output_hidden_states=torch.cat(outputs.hidden_states, dim=1)
+            else:
+                output_hidden_states = outputs.hidden_states[-1]
             output_ids = outputs.sequences
 
             seg_token_mask = output_ids[:, 1:] == self.seg_token_idx
@@ -528,7 +534,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states))
 
             last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
-            import pdb; pdb.set_trace()
+            # import pdb; pdb.set_trace()
             pred_embeddings = last_hidden_state[seg_token_mask]
 
             seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]

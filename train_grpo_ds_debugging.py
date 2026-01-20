@@ -1,3 +1,16 @@
+# 应该不需要initialize lisa model了
+import torch.distributed as dist
+import builtins
+import os
+# 保存原始 print
+def print_rank0(*args, **kwargs):
+    if int(os.getenv('RANK', '0')) == 0:  # 通过环境变量判断
+        print(*args, **kwargs)
+
+
+
+print_rank0("test 1")
+
 import argparse
 import os
 import shutil
@@ -10,19 +23,26 @@ import numpy as np
 import torch
 import tqdm
 import transformers
+from transformers import BitsAndBytesConfig, AutoTokenizer
 from peft import LoraConfig, get_peft_model
 from torch.utils.tensorboard import SummaryWriter
 
 from model.LISA import LISAForCausalLM
-# from model.LISA_qwen import LISAQwenForCausalLM
+from model.LISA_qwen import LISAQwenForCausalLM
 from model.llava import conversation as conversation_lib
-from utils.dataset import HybridDataset, ValDataset, collate_fn, ValDataset_EM
+from utils.dataset import HybridDataset, ValDataset, collate_fn_grpo, ValDataset_EM
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, IMAGE_TOKEN_INDEX, 
                          AverageMeter, ProgressMeter, Summary, dict_to_cuda,
                          intersectionAndUnionGPU, evaluate_text_metrics)
 import pdb
 import traceback
 import torch.nn as nn
+
+from model.grpo.data_parallel_ds import train_with_grpo, train_with_grpo_epoch
+from model.grpo.utils import optimize_model_memory
+from model.grpo.reward import combined_reward
+import copy
+
 
 def info(type, value, tb):
     traceback.print_exception(type, value, tb)
@@ -31,6 +51,15 @@ def info(type, value, tb):
 
 sys.excepthook = info
 
+
+def parse_tuple(input_str):
+    try:
+        # 去除括号和空格，分割成列表，再转为整数元组
+        tuple_result=tuple(map(int, input_str.strip("()").split(',')))
+        print_rank0(tuple_result)
+        return tuple_result
+    except:
+        raise argparse.ArgumentTypeError("Tuple must be in format '(a,b,c,d)'")
 
 
 def parse_args(args):
@@ -106,7 +135,7 @@ def parse_args(args):
     parser.add_argument("--print_freq", default=1, type=int)
     parser.add_argument("--start_epoch", default=0, type=int)
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
-    parser.add_argument("--train_mask_decoder", action="store_true", default=True)
+    parser.add_argument("--train_mask_decoder", action="store_true", default=False)
     parser.add_argument("--use_mm_start_end", action="store_true", default=True)
     parser.add_argument("--auto_resume", action="store_true", default=True)
     parser.add_argument(
@@ -122,22 +151,23 @@ def parse_args(args):
     parser.add_argument('--full_from_scratch', action='store_true', default=False)
     parser.add_argument('--score_text', action='store_true', default=False)
     parser.add_argument('--lora_module_full_finetune', action='store_true', default=False)
-
-    parser.add_argument("--grpo", action="store_true", default=False)
-    parser.add_argument("--epochs_grpo", default=20, type=int)
+    parser.add_argument("--num_generations", default=4, type=int)
+    # reward_weight default is (1,1,10,0)
     parser.add_argument(
-        "--batch_size_grpo", default=1, type=int, help="batch size per device per step"
+        "--reward_weights",
+        nargs=4,  # 要求4个值
+        type=int,
+        default=[1, 1, 10, 1],
+        help="Reward weights as 4 integers (default: 1 1 10 1)"
     )
-    parser.add_argument("--num_generations", default=3, type=int)
-    parser.add_argument("--steps_per_epoch_grpo", default=125, type=int)
-    parser.add_argument("--lr_grpo", default=0.00001, type=float)
-
     return parser.parse_args(args)
 
 
 def main(args):
+    torch.cuda.empty_cache()
     args = parse_args(args)
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
+    os.makedirs(args.vis_save_path, exist_ok=True)
     if args.local_rank == 0:
         os.makedirs(args.log_dir, exist_ok=True)
         writer = SummaryWriter(args.log_dir)
@@ -145,23 +175,34 @@ def main(args):
         writer = None
 
     # Create model
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(
         args.version,
-        # cache_dir="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/lisa",
+        cache_dir="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/lisa",
         model_max_length=args.model_max_length,
         padding_side="right",
         use_fast=False,
     )
+
+    if tokenizer.unk_token is not None:
+        tokenizer.pad_token = tokenizer.unk_token
+    else:
+        tokenizer.pad_token = "[PAD]"  # 设置默认填充标记
+
+    # 确保 pad_token 在词汇表中
+    if tokenizer.pad_token not in tokenizer.get_vocab():
+        tokenizer.add_special_tokens({"pad_token": tokenizer.pad_token})
+
     tokenizer.pad_token = tokenizer.unk_token
-    num_added_tokens = tokenizer.add_tokens("[SEG]")
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
 
-    if args.use_mm_start_end:
-        tokenizer.add_tokens(
-            [DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True
-        )
 
-    model_args = {
+    torch_dtype = torch.float32
+    if args.precision == "bf16":
+        torch_dtype = torch.bfloat16
+    elif args.precision == "fp16":
+        torch_dtype = torch.half
+
+    kwargs = {
         "train_mask_decoder": args.train_mask_decoder,
         "out_dim": args.out_dim,
         "ce_loss_weight": args.ce_loss_weight,
@@ -171,86 +212,74 @@ def main(args):
         "vision_pretrained": args.vision_pretrained,
         "vision_tower": args.vision_tower,
         "use_mm_start_end": args.use_mm_start_end,
+        "torch_dtype": torch_dtype
     }
-    torch_dtype = torch.float32
-    if args.precision == "bf16":
-        torch_dtype = torch.bfloat16
-    elif args.precision == "fp16":
-        torch_dtype = torch.half
-    model = LISAForCausalLM.from_pretrained(
-        args.version,
-        # cache_dir="/home/bingxing2/ailab/group/ai4neuro/EM_segmentation/model/lisa",
-        torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
-    )
+    # if args.load_in_4bit:
+    #     kwargs.update(
+    #         {
+    #             "torch_dtype": torch.half,
+    #             "load_in_4bit": True,
+    #             "quantization_config": BitsAndBytesConfig(
+    #                 load_in_4bit=True,
+    #                 bnb_4bit_compute_dtype=torch.float16,
+    #                 bnb_4bit_use_double_quant=True,
+    #                 bnb_4bit_quant_type="nf4",
+    #                 llm_int8_skip_modules=["visual_model"],
+    #             ),
+    #         }
+    #     )
+    # elif args.load_in_8bit:
+    #     kwargs.update(
+    #         {
+    #             "torch_dtype": torch.half,
+    #             "quantization_config": BitsAndBytesConfig(
+    #                 llm_int8_skip_modules=["visual_model"],
+    #                 load_in_8bit=True,
+    #             ),
+    #         }
+    #     )
+    if "qwen" in args.version:
+        model = LISAQwenForCausalLM.from_pretrained(
+            args.version, low_cpu_mem_usage=True, **kwargs
+        )
+    else:
+        model = LISAForCausalLM.from_pretrained(
+            args.version, low_cpu_mem_usage=True, **kwargs
+        )
+
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
 
-    model.enable_input_require_grads()
     model.gradient_checkpointing_enable()
 
     model.get_model().initialize_vision_modules(model.get_model().config)
     vision_tower = model.get_model().get_vision_tower()
     vision_tower.to(dtype=torch_dtype, device=args.local_rank)
-    if not args.eval_only:
-        model.get_model().initialize_lisa_modules(model.get_model().config)
 
-    for p in vision_tower.parameters():
-        p.requires_grad = False
-    for p in model.get_model().mm_projector.parameters():
-        p.requires_grad = False
+    # if args.precision == "bf16":
+    #     model = model.bfloat16().cuda()
+    # elif (
+    #     args.precision == "fp16" and (not args.load_in_4bit) and (not args.load_in_8bit)
+    # ):
+    #     vision_tower = model.get_model().get_vision_tower()
+    #     model.model.vision_tower = None
+    #     model_engine = deepspeed.init_inference(
+    #         model=model,
+    #         dtype=torch.half,
+    #         replace_with_kernel_inject=True,
+    #         replace_method="auto",
+    #     )
+    #     model = model_engine.module
+    #     model.model.vision_tower = vision_tower.half().cuda()
+    # elif args.precision == "fp32":
+    #     model = model.float().cuda()
 
     conversation_lib.default_conversation = conversation_lib.conv_templates[
         args.conv_type
     ]
 
-    lora_r = args.lora_r if not args.train_mask_decoder_only else 0
-    if args.full_finetune or args.full_from_scratch or args.eval_only or args.lora_module_full_finetune:
-        lora_r = 0
-    if lora_r > 0:
-
-        def find_linear_layers(model, lora_target_modules):
-            cls = torch.nn.Linear
-            lora_module_names = set()
-            for name, module in model.named_modules():
-                if (
-                    isinstance(module, cls) # 只看线性层
-                    and all(
-                        [
-                            x not in name
-                            for x in [
-                                "visual_model",
-                                "vision_tower",
-                                "mm_projector",
-                                "text_hidden_fcs",
-                            ] # 不希望用lora的模块
-                        ]
-                    )
-                    and any([x in name for x in lora_target_modules]) # 只对lora_target_modules的线性层应用LoRA
-                ):
-                    lora_module_names.add(name)
-            return sorted(list(lora_module_names))
-
-        lora_alpha = args.lora_alpha
-        lora_dropout = args.lora_dropout
-        lora_target_modules = find_linear_layers(
-            model, args.lora_target_modules.split(",")
-        )
-        # print("lora module",lora_target_modules)
-        lora_config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=lora_target_modules,
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM", # 因果语言模型；通常用于生成式语言模型
-        )
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
-
-    model.resize_token_embeddings(len(tokenizer))
-
-    # make text_hidden_fcs, mask_decoder, lm_head, embed_tokens trainable
+    
     if args.train_mask_decoder_only:
         trainable_params=["mask_decoder"]
         for n, p in model.named_parameters():
@@ -260,7 +289,6 @@ def main(args):
                     for x in trainable_params
                 ]
             ):
-                print("n: ", n, "p.shape: ", p.shape)
                 p.requires_grad = True
             else:
                 p.requires_grad = False
@@ -289,10 +317,9 @@ def main(args):
         for n, p in model.named_parameters():
             is_target = any([module_name in n for module_name in full_finetune_module_names])
             if is_target:
-                # print("Full finetuning module - n: ", n, "p.shape: ", p.shape)
                 p.requires_grad = True
         # 之前的训练模块
-        trainable_params=["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
+        trainable_params=["lm_head", "embed_tokens", "text_hidden_fcs"]
         for n, p in model.named_parameters():
             if any(
                 [
@@ -300,13 +327,13 @@ def main(args):
                     for x in trainable_params
                 ]
             ):
-                # print("n: ", n, "p.shape: ", p.shape)
                 p.requires_grad = True
     elif args.full_finetune:
         for n, p in model.named_parameters():
             p.requires_grad = True
     elif args.full_from_scratch:
-        print('initialize all params')
+        # 只在rank0打印
+        print_rank0('initialize all params')
         for n, p in model.named_parameters():
             p.requires_grad = True
             # initialize
@@ -316,7 +343,7 @@ def main(args):
                 nn.init.zeros_(p)  # 偏置通常初始化为零，但你可以根据需要选择其他方法
 
     else:
-        trainable_params=["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
+        trainable_params=["lm_head", "embed_tokens", "text_hidden_fcs"]
         for n, p in model.named_parameters():
             if any(
                 [
@@ -327,25 +354,24 @@ def main(args):
                 # print("n: ", n, "p.shape: ", p.shape)
                 p.requires_grad = True
     # pdb.set_trace()
-    if args.train_mask_decoder_only:
-        assert args.train_from_scratch == False, "train_from_scratch not supported when training mask decoder only"
-    if not args.train_from_scratch and not args.full_from_scratch:
-        print("loading from pretrained")
-        lisa_params=torch.load('/mnt/shared-storage-user/caijinyu/model/lisa_params.pt')
-        for name, param in lisa_params.items():
-            # print(name)
-            name="base_model.model."+name
-            # pdb.set_trace()
-            if name in model.state_dict():
-                # print("load {}".format(name))
-                model.state_dict()[name].copy_(param)
-        del lisa_params
-
+    # if args.train_mask_decoder_only:
+    #     assert args.train_from_scratch == False, "train_from_scratch not supported when training mask decoder only"
+    # if not args.train_from_scratch and not args.full_from_scratch:
+    #     print("loading from pretrained")
+    #     lisa_params=torch.load('/mnt/shared-storage-user/caijinyu/model/lisa_params.pt')
+    #     for name, param in lisa_params.items():
+    #         # print(name)
+    #         name="base_model.model."+name
+    #         # pdb.set_trace()
+    #         if name in model.state_dict():
+    #             # print("load {}".format(name))
+    #             model.state_dict()[name].copy_(param)
+    #     del lisa_params
     # print all trainable parameters
-    print("##########")
+    print_rank0("##########")
     for name, param in model.named_parameters():
         if param.requires_grad:
-            print(name)
+            print_rank0(name)
 
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1
@@ -389,13 +415,13 @@ def main(args):
                 args.val_dataset,
                 args.image_size,
             )
-        print(
+        print_rank0(
             f"Training with {len(train_dataset)} examples and validating with {len(val_dataset)} examples."
         )
     else:
         val_dataset = None
-        print(f"Training with {len(train_dataset)} examples.")
-
+        print_rank0(f"Training with {len(train_dataset)} examples.")
+    
     ds_config = {
         "train_micro_batch_size_per_gpu": args.batch_size,
         "gradient_accumulation_steps": args.grad_accumulation_steps,
@@ -429,16 +455,20 @@ def main(args):
             "contiguous_gradients": True,
             "overlap_comm": True,
             "reduce_scatter": True,
-            "reduce_bucket_size": 5e8,
-            "allgather_bucket_size": 5e8,
+            "reduce_bucket_size": 2e8,
+            "allgather_bucket_size": 2e8,
         },
+        "activation_checkpointing": {
+            "partition_activations": True,
+            "contiguous_memory_optimization": True
+        }
     }
     model_engine, _ , train_loader, scheduler = deepspeed.initialize(
         model=model,
         model_parameters=model.parameters(),
         training_data=train_dataset,
         collate_fn=partial(
-            collate_fn,
+            collate_fn_grpo,
             tokenizer=tokenizer,
             conv_type=args.conv_type,
             use_mm_start_end=args.use_mm_start_end,
@@ -446,25 +476,34 @@ def main(args):
         ),
         config=ds_config,
     )
-
+    train_iter = iter(train_loader)
     # resume deepspeed checkpoint
     if args.auto_resume and len(args.resume) == 0:
-        resume = os.path.join(args.log_dir, "ckpt_model")
+        resume = os.path.join(args.log_dir, "ckpt_model_grpo")
         if os.path.exists(resume):
             args.resume = resume
+        else:
+            resume = os.path.join(args.log_dir, "ckpt_model")
+            if os.path.exists(resume):
+                args.resume = resume
 
     if args.resume:
+        import pdb; pdb.set_trace()
         load_path, client_state = model_engine.load_checkpoint(args.resume)
         with open(os.path.join(args.resume, "latest"), "r") as f:
             ckpt_dir = f.readlines()[0].strip()
-        args.start_epoch = (
-            int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
-        )
-        print(
+        if "grpo" in args.resume:
+            args.start_epoch = (
+                int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
+            )
+        else:
+            args.start_epoch = 0
+        print_rank0(
             "resume training from {}, start from epoch {}".format(
                 args.resume, args.start_epoch
             )
         )
+    
 
     # validation dataset
     if val_dataset is not None:
@@ -480,7 +519,7 @@ def main(args):
             pin_memory=False,
             sampler=val_sampler,
             collate_fn=partial(
-                collate_fn,
+                collate_fn_grpo,
                 tokenizer=tokenizer,
                 conv_type=args.conv_type,
                 use_mm_start_end=args.use_mm_start_end,
@@ -488,273 +527,101 @@ def main(args):
             ),
         )
 
-    train_iter = iter(train_loader)
-    best_score, cur_ciou = 0.0, 0.0
 
-    if args.eval_only:
+    if False:
         if args.score_text:
             # import pdb; pdb.set_trace()
             giou, ciou, text_metrics = validate_text(val_loader, model_engine, 0, writer, tokenizer, args)
-            print(giou,ciou,text_metrics)
+            # print(giou,ciou,text_metrics)
         else:
             giou, ciou = validate(val_loader, model_engine, 0, writer, args)
-            text_metrics={}
-        exit()
+        best_score=giou
+        cur_ciou=ciou
+    else:
+        best_score=0.5929
+        cur_ciou=0.6460
+    torch.cuda.empty_cache()
+    print_rank0("\nStarting RL fine-tuning using GRPO...")
+    # This config was tested on a 8xA100 node, where each A100 is has 80GB of VRAM
+    training_config = {
+        'num_iterations': args.epochs,
+        'num_steps': args.steps_per_epoch,
+        'batch_size': args.batch_size, # reduce if you have fewer GPUs
+        'num_generations': args.num_generations, # reduce if you have GPUs with less VRAM
+        'max_completion_length': args.model_max_length, # reduce if you have GPUs with less VRAM
+        'beta': 0.04,
+        'learning_rate': args.lr,
+        'mu': 1,
+        'epsilon': 0.1
+    }
+    num_gpus = torch.cuda.device_count()
+
+    dtype = next(model_engine.module.parameters()).dtype
+    # ------------------------------------------------
+    # 构造 reference model —— 深拷贝训练模型并冻结
+    # ------------------------------------------------
+    ref_base_model = copy.deepcopy(model_engine.module).cpu().eval()
+    for p in ref_base_model.parameters():
+        p.requires_grad = False
+
+    ref_infer_engine = deepspeed.init_inference(
+        model=ref_base_model,
+        mp_size=1,
+        dtype=dtype,
+        replace_with_kernel_inject=False     # ← 禁止 kernel 注入
+    )
+    
+    # ------------------------------------------------
+    # 构造 policy 推理模型 —— 参数与训练 engine 同步，但不参与梯度
+    # ------------------------------------------------
+    policy_base_model = copy.deepcopy(model_engine.module).cpu().eval()
+    for p in policy_base_model.parameters():
+        p.requires_grad = False
+
+    policy_infer_engine = deepspeed.init_inference(
+        model=policy_base_model,
+        mp_size=1,
+        dtype=dtype,
+        replace_with_kernel_inject=False     # ← 禁止 kernel 注入
+    )
 
     for epoch in range(args.start_epoch, args.epochs):
-        # train for one epoch
-        train_iter = train(
-            train_loader,
-            model_engine,
-            epoch,
-            scheduler,
-            writer,
-            train_iter,
-            args,
+        print_rank0("Epoch: ", epoch)
+        model_engine = train_with_grpo_epoch(
+            ref_infer_engine=ref_infer_engine,
+            policy_infer_engine=policy_infer_engine,
+            policy_base_model=policy_base_model,
+            model_engine=model_engine,
+            tokenizer=tokenizer,
+            train_dataloader=train_loader,
+            train_iter=train_iter,
+            reward_function=partial(combined_reward, weight=args.reward_weights),
+            device_ids=list(range(num_gpus)) if num_gpus > 1 else None,
+            **training_config
         )
-        # pdb.set_trace()
-
         if args.no_eval == False:
-            if args.score_text:
-                giou, ciou, text_metrics = validate_text(val_loader, model_engine, epoch, writer, tokenizer, args)
-            else:
-                giou, ciou = validate(val_loader, model_engine, epoch, writer, args)
-                text_metrics={}
+            giou, ciou = validate(val_loader, model, 0, writer, args)
             is_best = giou > best_score
             best_score = max(giou, best_score)
             cur_ciou = ciou if is_best else cur_ciou
-
+                
         if args.no_eval or is_best:
-            save_dir = os.path.join(args.log_dir, "ckpt_model")
+            save_dir = os.path.join(args.log_dir, "ckpt_model_grpo")
             if args.local_rank == 0:
-                torch.save(
-                    text_metrics.update({"epoch": epoch}),
+                torch.save({},
                     os.path.join(
                         args.log_dir,
-                        "meta_log_giou{:.3f}_ciou{:.3f}.pth".format(
-                            best_score, cur_ciou
+                            "meta_log_epoch{}_giou{:.3f}_ciou{:.3f}.pth".format(
+                            epoch, best_score, cur_ciou
                         ),
-                    ),
-                )
+                    ))
                 if os.path.exists(save_dir):
                     shutil.rmtree(save_dir)
             torch.distributed.barrier()
             model_engine.save_checkpoint(save_dir)
-    
-
-    if args.grpo:
-        import copy
-        from model.grpo.data_parallel_ds import train_with_grpo_epoch
-        from model.grpo.reward import combined_reward
-        def clean_copy(model_engine):
-            # 获取模型本体（兼容 DDP/FSDP）
-            model = model_engine.module if hasattr(model_engine, "module") else model_engine
-
-            # 1. 创建同结构的新模型
-            model_class = model.__class__
-            new_model = model_class.__new__(model_class)
-
-            # 2. 构造新模型（init）
-            new_model.__dict__.update({k: v for k, v in model.__dict__.items() if k not in ['_forward_hooks', '_backward_hooks']})
-            new_model.__init__(*getattr(model, "_init_args", ()), **getattr(model, "_init_kwargs", {}))
-
-            # 3. 复制参数（避免 deepcopy）
-            new_model.load_state_dict(model.state_dict(), strict=True)
-
-            return new_model.cpu().eval()
-
-        print("\nStarting RL fine-tuning using GRPO...")
-        num_gpus = torch.cuda.device_count()
-        # This config was tested on a 8xA100 node, where each A100 is has 80GB of VRAM
-        training_config = {
-            'num_iterations': args.epochs_grpo,
-            'num_steps': args.steps_per_epoch_grpo,
-            'batch_size': args.batch_size_grpo, # reduce if you have fewer GPUs
-            'num_generations': args.num_generations, # reduce if you have GPUs with less VRAM
-            'max_completion_length': args.model_max_length, # reduce if you have GPUs with less VRAM
-            'beta': 0.04,
-            'learning_rate': args.lr_grpo,
-            'mu': 1,
-            'epsilon': 0.1
-        }
-        dtype = next(model_engine.module.parameters()).dtype
-        ref_base_model = clean_copy(model_engine)
-        for p in ref_base_model.parameters():
-            p.requires_grad = False
-
-        ref_infer_engine = deepspeed.init_inference(
-            model=ref_base_model,
-            mp_size=1,
-            dtype=dtype,
-            replace_with_kernel_inject=False     # ← 禁止 kernel 注入
-        )
-        policy_base_model = clean_copy(model_engine)
-        for p in policy_base_model.parameters():
-            p.requires_grad = False
-
-        policy_infer_engine = deepspeed.init_inference(
-            model=policy_base_model,
-            mp_size=1,
-            dtype=dtype,
-            replace_with_kernel_inject=False     # ← 禁止 kernel 注入
-        )
-        for epoch in range(0, args.epochs_grpo):
-            print("Epoch: ", epoch)
-            model_engine = train_with_grpo_epoch(
-                ref_infer_engine=ref_infer_engine,
-                policy_infer_engine=policy_infer_engine,
-                policy_base_model=policy_base_model,
-                model_engine=model_engine,
-                tokenizer=tokenizer,
-                train_dataloader=train_loader,
-                train_iter=train_iter,
-                reward_function=combined_reward,
-                device_ids=list(range(num_gpus)) if num_gpus > 1 else None,
-                **training_config
-            )
-            if args.no_eval == False:
-                giou, ciou = validate(val_loader, model, 0, writer, args)
-                is_best = giou > best_score
-                best_score = max(giou, best_score)
-                cur_ciou = ciou if is_best else cur_ciou
-                    
-            if args.no_eval or is_best:
-                save_dir = os.path.join(args.log_dir, "ckpt_model_grpo")
-                if args.local_rank == 0:
-                    torch.save({},
-                        os.path.join(
-                            args.log_dir,
-                                "meta_log_grpo_epoch{}_giou{:.3f}_ciou{:.3f}.pth".format(
-                                epoch, best_score, cur_ciou
-                            ),
-                        ))
-                    if os.path.exists(save_dir):
-                        shutil.rmtree(save_dir)
-                torch.distributed.barrier()
-                model_engine.save_checkpoint(save_dir)
+                
 
 
-def train(
-    train_loader,
-    model,
-    epoch,
-    scheduler,
-    writer,
-    train_iter,
-    args,
-):
-    """Main training loop."""
-    batch_time = AverageMeter("Time", ":6.3f")
-    data_time = AverageMeter("Data", ":6.3f")
-    losses = AverageMeter("Loss", ":.4f")
-    ce_losses = AverageMeter("CeLoss", ":.4f")
-    mask_bce_losses = AverageMeter("MaskBCELoss", ":.4f")
-    mask_dice_losses = AverageMeter("MaskDICELoss", ":.4f")
-    mask_losses = AverageMeter("MaskLoss", ":.4f")
-
-    progress = ProgressMeter(
-        args.steps_per_epoch,
-        [
-            batch_time,
-            losses,
-            ce_losses,
-            mask_losses,
-            mask_bce_losses,
-            mask_dice_losses,
-        ],
-        prefix="Epoch: [{}]".format(epoch),
-    )
-
-    # switch to train mode
-    model.train()
-    end = time.time()
-    for global_step in range(args.steps_per_epoch):
-        for i in range(args.grad_accumulation_steps):
-            try:
-                input_dict = next(train_iter)
-            except:
-                train_iter = iter(train_loader)
-                input_dict = next(train_iter)
-
-            data_time.update(time.time() - end)
-            input_dict = dict_to_cuda(input_dict)
-
-            if args.precision == "fp16":
-                input_dict["images"] = input_dict["images"].half()
-                input_dict["images_clip"] = input_dict["images_clip"].half()
-            elif args.precision == "bf16":
-                input_dict["images"] = input_dict["images"].bfloat16()
-                input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
-            else:
-                input_dict["images"] = input_dict["images"].float()
-                input_dict["images_clip"] = input_dict["images_clip"].float()
-            
-            # print(input_dict["images"].shape,input_dict["input_ids"].shape)  torch.Size([8, 3, 1024, 1024]) torch.Size([20?, 191])
-            # import pdb; pdb.set_trace()
-            output_dict = model(**input_dict)
-
-            loss = output_dict["loss"]
-            ce_loss = output_dict["ce_loss"]
-            mask_bce_loss = output_dict["mask_bce_loss"]
-            mask_dice_loss = output_dict["mask_dice_loss"]
-            mask_loss = output_dict["mask_loss"]
-
-            losses.update(loss.item(), input_dict["images"].size(0))
-            ce_losses.update(ce_loss.item(), input_dict["images"].size(0))
-            mask_bce_losses.update(mask_bce_loss.item(), input_dict["images"].size(0))
-            mask_dice_losses.update(mask_dice_loss.item(), input_dict["images"].size(0))
-            mask_losses.update(mask_loss.item(), input_dict["images"].size(0))
-            model.backward(loss)
-            model.step()
-            torch.cuda.empty_cache() 
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-        if global_step % args.print_freq == 0:
-            if args.distributed:
-                batch_time.all_reduce()
-                data_time.all_reduce()
-
-                losses.all_reduce()
-                ce_losses.all_reduce()
-                mask_bce_losses.all_reduce()
-                mask_dice_losses.all_reduce()
-                mask_losses.all_reduce()
-
-            if args.local_rank == 0:
-                progress.display(global_step + 1)
-                writer.add_scalar("train/loss", losses.avg, global_step)
-                writer.add_scalar("train/ce_loss", ce_losses.avg, global_step)
-                writer.add_scalar(
-                    "train/mask_bce_loss", mask_bce_losses.avg, global_step
-                )
-                writer.add_scalar(
-                    "train/mask_dice_loss", mask_dice_losses.avg, global_step
-                )
-                writer.add_scalar("train/mask_loss", mask_losses.avg, global_step)
-                writer.add_scalar(
-                    "metrics/total_secs_per_batch", batch_time.avg, global_step
-                )
-                writer.add_scalar(
-                    "metrics/data_secs_per_batch", data_time.avg, global_step
-                )
-
-            batch_time.reset()
-            data_time.reset()
-            losses.reset()
-            ce_losses.reset()
-            mask_bce_losses.reset()
-            mask_dice_losses.reset()
-            mask_losses.reset()
-
-        if global_step != 0:
-            curr_lr = scheduler.get_last_lr()
-            if args.local_rank == 0:
-                writer.add_scalar("train/lr", curr_lr[0], global_step)
-
-    return train_iter
 
 
 def validate(val_loader, model_engine, epoch, writer, args):
@@ -811,10 +678,9 @@ def validate(val_loader, model_engine, epoch, writer, args):
     giou = acc_iou_meter.avg[1]
 
     if args.local_rank == 0:
-        if writer is not None:
-            writer.add_scalar("val/giou", giou, epoch)
-            writer.add_scalar("val/ciou", ciou, epoch)
-        print("giou: {:.4f}, ciou: {:.4f}".format(giou, ciou))
+        writer.add_scalar("val/giou", giou, epoch)
+        writer.add_scalar("val/ciou", ciou, epoch)
+        print_rank0("giou: {:.4f}, ciou: {:.4f}".format(giou, ciou))
 
     return giou, ciou
 

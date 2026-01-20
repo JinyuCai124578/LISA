@@ -293,7 +293,7 @@ def collate_fn_grpo(
             parts = rou.split(sep)
             # if len(parts) != 2:
             #     break
-            assert len(parts) == 2, (len(parts), rou, sep)
+            assert len(parts) == 2, (len(parts), rou, sep, conv.sep2, conv_type)
             parts[0] += sep
 
             if DEFAULT_IMAGE_TOKEN in conversation:
